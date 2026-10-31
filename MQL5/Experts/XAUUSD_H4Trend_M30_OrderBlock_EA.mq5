@@ -76,16 +76,23 @@ input group "=== Risk ==="
 input ENUM_LOT_MODE InpLotMode            = LOT_RISK_PERCENT; // Lot sizing mode
 input double        InpFixedLot           = 0.01; // Fixed lot (if fixed mode)
 input double        InpRiskPercent        = 1.0;  // Risk % of equity per trade (if risk mode)
-input double        InpRewardRisk         = 2.0;  // Take profit = X * stop distance (R:R)
-input int           InpSLBufferPoints     = 100;  // SL buffer beyond the OB (points)
+input double        InpRewardRisk         = 2.7;  // Final take profit = X * stop distance (R:R)
+input int           InpSLBufferPoints     = 100;  // SL buffer beyond the OB wick (points)
+input double        InpSLBufferATR        = 0.5;  // + extra SL buffer = X * ATR(M30) (0 = off)
 input int           InpMinSLPoints        = 300;  // Minimum SL distance (points)
-input int           InpMaxSLPoints        = 2500; // Maximum SL distance, skip trade if larger (points)
+input int           InpMaxSLPoints        = 5000; // Maximum SL distance, skip trade if larger (points)
 input int           InpMaxSpreadPoints    = 60;   // Max spread allowed to open (points)
-input int           InpMaxTradesPerSession= 1;    // Max trades opened per session
+input int           InpMaxTradesPerSession= 1;    // Max setups (entries) per session
 input int           InpSlippagePoints     = 30;   // Max slippage (points)
 
+input group "=== Two trades per setup (partial + runner) ==="
+input bool   InpTwoTrades           = true; // Open 2 trades on each confirmed setup
+input double InpTP1RR               = 1.0;  // Trade 1 (partial) take profit = X R
+input double InpPartialLotPercent   = 50.0; // % of the total lot used for trade 1
+input int    InpRunnerBELockPoints  = 20;   // Trade 2: SL to breakeven + X points when trade 1 TP is reached
+
 input group "=== Trade management ==="
-input bool   InpUseBreakeven        = true; // Move SL to breakeven
+input bool   InpUseBreakeven        = true; // Single-trade mode: move SL to breakeven
 input double InpBreakevenAtR        = 1.0;  // ...when profit reaches X R
 input int    InpBreakevenLockPoints = 20;   // ...and lock this many points
 input bool   InpUseTrailing         = false;// ATR trailing stop
@@ -125,6 +132,9 @@ string     gStatus        = "Starting...";
 datetime   gLastCloseFail = 0;
 
 const string OB_OBJ_NAME = "H4M30OB_ActiveZone";
+
+string CommentPartial() { return InpComment + "_P"; }
+string CommentRunner()  { return InpComment + "_R"; }
 
 //+------------------------------------------------------------------+
 //| Helpers: time                                                    |
@@ -238,9 +248,42 @@ int CountTradesSince(const datetime from)
          continue;
       if(HistoryDealGetInteger(tk, DEAL_ENTRY) != DEAL_ENTRY_IN)
          continue;
+      if(HistoryDealGetString(tk, DEAL_COMMENT) == CommentRunner())
+         continue;   // 2-trade setup counts once
       n++;
      }
    return n;
+  }
+
+// Stop loss the position was opened with (from its opening order)
+double InitialSL(const ulong posId, const double fallback)
+  {
+   if(HistorySelectByPosition(posId))
+     {
+      for(int i = 0; i < HistoryOrdersTotal(); i++)
+        {
+         ulong ot = HistoryOrderGetTicket(i);
+         if(ot == 0)
+            continue;
+         double s = HistoryOrderGetDouble(ot, ORDER_SL);
+         if(s > 0)
+            return s;
+        }
+     }
+   return fallback;
+  }
+
+bool PartialLegOpen()
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !IsMine())
+         continue;
+      if(PositionGetString(POSITION_COMMENT) == CommentPartial())
+         return true;
+     }
+   return false;
   }
 
 void CloseAllPositions(const string reason)
@@ -616,6 +659,20 @@ bool SignalOnLastCandle()
    return false;
   }
 
+bool SendOrder(const int dir, const double lots, const double price, const double sl, const double tp, const string cmt)
+  {
+   bool ok = (dir < 0) ? trade.Sell(lots, _Symbol, price, sl, tp, cmt)
+                       : trade.Buy(lots, _Symbol, price, sl, tp, cmt);
+   if(ok && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_PLACED))
+     {
+      PrintFormat("Opened %s %s %.2f lots SL %s TP %s", cmt, dir < 0 ? "SELL" : "BUY", lots,
+                  DoubleToString(sl, _Digits), DoubleToString(tp, _Digits));
+      return true;
+     }
+   PrintFormat("Order %s failed: %u %s", cmt, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+   return false;
+  }
+
 void OpenTrade()
   {
    int    dir   = gOB.dir;
@@ -624,8 +681,16 @@ void OpenTrade()
    double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double price = (dir < 0) ? bid : ask;
 
-   double sl = (dir < 0) ? gOB.wickHi + InpSLBufferPoints * point + (ask - bid)
-                         : gOB.wickLo - InpSLBufferPoints * point;
+   double atrBuf = 0;
+   if(InpSLBufferATR > 0)
+     {
+      double a[1];
+      if(CopyBuffer(hATR, 0, 1, 1, a) == 1)
+         atrBuf = InpSLBufferATR * a[0];
+     }
+   double buffer = InpSLBufferPoints * point + atrBuf;
+   double sl = (dir < 0) ? gOB.wickHi + buffer + (ask - bid)
+                         : gOB.wickLo - buffer;
 
    // price must still be on the right side of the OB
    if((dir < 0 && price >= sl) || (dir > 0 && price <= sl))
@@ -650,9 +715,11 @@ void OpenTrade()
       return;
      }
 
-   double tp = (dir < 0) ? price - InpRewardRisk * dist : price + InpRewardRisk * dist;
-   sl = RoundToTick(sl);
-   tp = RoundToTick(tp);
+   double tp  = (dir < 0) ? price - InpRewardRisk * dist : price + InpRewardRisk * dist;
+   double tp1 = (dir < 0) ? price - InpTP1RR * dist      : price + InpTP1RR * dist;
+   sl  = RoundToTick(sl);
+   tp  = RoundToTick(tp);
+   tp1 = RoundToTick(tp1);
 
    double lots = CalcLots(dir, price, sl);
    if(lots <= 0)
@@ -661,21 +728,41 @@ void OpenTrade()
       return;
      }
 
-   bool ok = (dir < 0) ? trade.Sell(lots, _Symbol, price, sl, tp, InpComment)
-                       : trade.Buy(lots, _Symbol, price, sl, tp, InpComment);
-   if(ok && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_PLACED))
+   gLastTradedOB = gOB.obTime;   // never re-enter the same OB, even if an order fails
+
+   if(!InpTwoTrades)
      {
-      gLastTradedOB = gOB.obTime;
-      gStatus = StringFormat("%s %.2f lots @ %s SL %s TP %s", dir < 0 ? "SELL" : "BUY", lots,
-                             DoubleToString(price, _Digits), DoubleToString(sl, _Digits), DoubleToString(tp, _Digits));
-      Print("Opened: ", gStatus);
+      if(SendOrder(dir, lots, price, sl, tp, InpComment))
+         gStatus = StringFormat("%s %.2f @ %s SL %s TP %s", dir < 0 ? "SELL" : "BUY", lots,
+                                DoubleToString(price, _Digits), DoubleToString(sl, _Digits), DoubleToString(tp, _Digits));
+      return;
      }
-   else
+
+   // split total risk into partial leg + runner leg
+   double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0) step = 0.01;
+   int    vd   = (int)MathMax(0, MathCeil(-MathLog10(step) - 1e-9));
+   double lot1 = MathFloor(lots * InpPartialLotPercent / 100.0 / step + 1e-9) * step;
+   double lot2 = lots - lot1;
+   if(lot1 < vmin || lot2 < vmin)
      {
-      gStatus = StringFormat("Order failed: %u %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
-      Print(gStatus);
+      Print("Total lot too small to split - using min lot for each trade (risk is higher than set)");
+      lot1 = MathMax(lot1, vmin);
+      lot2 = MathMax(lot2, vmin);
      }
+   lot1 = NormalizeDouble(lot1, vd);
+   lot2 = NormalizeDouble(lot2, vd);
+
+   bool ok1 = SendOrder(dir, lot1, price, sl, tp1, CommentPartial());
+   double price2 = (dir < 0) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   bool ok2 = SendOrder(dir, lot2, price2, sl, tp, CommentRunner());
+   gStatus = StringFormat("%s @ %s SL %s | T1 %.2f TP %s %s | T2 %.2f TP %s %s",
+                          dir < 0 ? "SELL" : "BUY", DoubleToString(price, _Digits), DoubleToString(sl, _Digits),
+                          lot1, DoubleToString(tp1, _Digits), ok1 ? "ok" : "FAILED",
+                          lot2, DoubleToString(tp, _Digits), ok2 ? "ok" : "FAILED");
   }
+
 
 void OnNewBar(const bool allowEntry)
   {
@@ -740,7 +827,7 @@ void ManageSession()
 
 void ManagePositions()
   {
-   if(!InpUseBreakeven && !InpUseTrailing)
+   if(!InpTwoTrades && !InpUseBreakeven && !InpUseTrailing)
       return;
 
    double point = _Point;
@@ -756,6 +843,8 @@ void ManagePositions()
          atr = a[0];
      }
 
+   bool partialOpen = PartialLegOpen();
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong tk = PositionGetTicket(i);
@@ -766,24 +855,36 @@ void ManagePositions()
       double open = PositionGetDouble(POSITION_PRICE_OPEN);
       double sl   = PositionGetDouble(POSITION_SL);
       double tp   = PositionGetDouble(POSITION_TP);
-      if(tp == 0 || InpRewardRisk <= 0)
-         continue;
-      double R = MathAbs(tp - open) / InpRewardRisk;   // initial risk distance
+      string cmt  = PositionGetString(POSITION_COMMENT);
+      double R    = MathAbs(open - InitialSL((ulong)PositionGetInteger(POSITION_IDENTIFIER), sl)); // initial risk
       if(R <= 0)
          continue;
 
       bool   isBuy  = (type == POSITION_TYPE_BUY);
       double profit = isBuy ? (bid - open) : (open - ask);
       double newSL  = sl;
+      bool   runner = (cmt == CommentRunner());
 
-      if(InpUseBreakeven && profit >= InpBreakevenAtR * R)
+      // Trade 2 (runner): breakeven once trade 1's TP level is reached,
+      // or once trade 1 is gone while price is in profit (it hit its TP)
+      bool beNow = false;
+      int  lock  = InpBreakevenLockPoints;
+      if(runner)
         {
-         double be = isBuy ? open + InpBreakevenLockPoints * point : open - InpBreakevenLockPoints * point;
+         beNow = (profit >= InpTP1RR * R) || (!partialOpen && profit > InpRunnerBELockPoints * point);
+         lock  = InpRunnerBELockPoints;
+        }
+      else if(!InpTwoTrades && InpUseBreakeven)
+         beNow = (profit >= InpBreakevenAtR * R);
+
+      if(beNow)
+        {
+         double be = isBuy ? open + lock * point : open - lock * point;
          if(isBuy  && (sl == 0 || be > newSL)) newSL = be;
          if(!isBuy && (sl == 0 || be < newSL)) newSL = be;
         }
 
-      if(InpUseTrailing && atr > 0 && profit >= InpTrailStartR * R)
+      if(InpUseTrailing && atr > 0 && profit >= InpTrailStartR * R && (runner || !InpTwoTrades))
         {
          double tr = isBuy ? bid - InpTrailATRMult * atr : ask + InpTrailATRMult * atr;
          if(isBuy  && tr > newSL) newSL = tr;
@@ -826,7 +927,9 @@ int OnInit()
    if(InpRewardRisk <= 0 || InpRiskPercent <= 0 || InpFixedLot <= 0 ||
       InpMinSLPoints <= 0 || InpMaxSLPoints <= InpMinSLPoints ||
       InpM30SwingStrength < 1 || InpH4SwingStrength < 1 || InpH4FastEMA >= InpH4SlowEMA ||
-      InpMaxTradesPerSession < 1)
+      InpMaxTradesPerSession < 1 || InpSLBufferATR < 0 ||
+      (InpTwoTrades && (InpTP1RR <= 0 || InpTP1RR >= InpRewardRisk ||
+                        InpPartialLotPercent <= 0 || InpPartialLotPercent >= 100)))
      {
       Print("Invalid risk/indicator inputs");
       return INIT_PARAMETERS_INCORRECT;

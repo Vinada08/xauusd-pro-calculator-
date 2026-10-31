@@ -15,8 +15,14 @@ File: `MQL5/Experts/XAUUSD_H4Trend_M30_OrderBlock_EA.mq5`
    - Bearish OB = the last bullish M30 candle before an impulsive drop that **broke the previous M30 swing low (BOS)**, with displacement ≥ `InpMinImpulseATR` × ATR. Bullish OB is the mirror.
    - The newest such OB that is still valid (no M30 close beyond its wick) is used. With `InpFreshOBOnly` only the first retest is traded.
    - Entry on the M30 close that retests the OB and confirms (`InpConfirm`: touch / rejection past mid of OB / close back outside OB).
-   - SL beyond the OB wick + buffer, TP = `InpRewardRisk` × SL distance. Optional breakeven and ATR trailing.
-3. **One-day session window**
+   - SL beyond the OB wick + buffer (`InpSLBufferPoints` + `InpSLBufferATR` × ATR), final TP = `InpRewardRisk` × SL distance (default 2.7R).
+   - Example (sell): entry 4027, OB top ≈ 4042 → SL ≈ 4061, final TP ≈ 3938.
+4. **Two trades per confirmed setup** (`InpTwoTrades = true`)
+   - Trade 1 (partial): `InpPartialLotPercent` % of the lot, TP at `InpTP1RR` R (default 1R ≈ 3993 in the example).
+   - Trade 2 (runner): the rest of the lot, TP at the final target. When trade 1's TP is reached, trade 2's SL moves to **breakeven** (+ `InpRunnerBELockPoints`).
+   - Both trades share the same SL and the total risk is `InpRiskPercent`. They count as one setup for `InpMaxTradesPerSession`.
+   - Both are still force-closed at the session close (04:30) if they are open.
+5. **One-day session window**
    - `InpSessionStart` (e.g. `13:00` or `02:00`) → `InpSessionClose` (`04:30`). The window can wrap past midnight.
    - New trades are only opened inside the window (and not in the last `InpNoEntryMinutesBeforeClose` minutes).
    - **Every EA trade is closed at the session close time (04:30)** — also checked by a timer, so it works with no ticks.
