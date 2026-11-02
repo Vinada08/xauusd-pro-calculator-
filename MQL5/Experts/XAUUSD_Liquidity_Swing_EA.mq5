@@ -23,13 +23,25 @@
 //|     market close, which is the last possible moment).            |
 //|  6. Telegram report bot: zones, order blocks, entries, TP / SL,  |
 //|     weekly close, daily + weekly reports and /commands.          |
+//|                                                                  |
+//|  v2.00 FILTERS & MANAGEMENT                                      |
+//|  7. High-impact news filter: no new entries 30 min before /      |
+//|     after high-impact USD news (MT5 economic calendar; manual    |
+//|     list + NFP rule in the Strategy Tester).                     |
+//|  8. Market session filter: entries only in London / New York    |
+//|     (DST-aware, local exchange hours).                           |
+//|  9. HTF trend filter: D1 / W1 moving average and / or market     |
+//|     structure - sells only in a down trend, buys only in an up.  |
+//| 10. ATR trailing stop for the TP2 trade once TP1 is hit          |
+//|     (replaces the fixed 1:2 target, or runs on top of it).       |
+//| 11. M5 ChoCH / structure-break confirmation after the OB touch.  |
 //+------------------------------------------------------------------+
 #property copyright   "xauusd-pro-calculator"
 #property link        "https://github.com/vinada08/xauusd-pro-calculator-"
-#property version     "1.00"
-#property description "XAUUSD swing EA: D1 Fri/Mon/Tue liquidity zones -> H4 order block -> M5 rejection entry."
-#property description "Every setup = 2 trades: TP1 at the Tuesday D1 50% (yellow) + TP2 at 1:2 risk reward."
-#property description "New entries Wed/Thu/Fri only. Weekly force-close Saturday 04:30. Telegram report bot."
+#property version     "2.00"
+#property description "XAUUSD swing EA: D1 Fri/Mon/Tue liquidity zones -> H4 order block -> M5 rejection + ChoCH entry."
+#property description "Every setup = 2 trades: TP1 at the Tuesday D1 50% (yellow) + TP2 trade with ATR trailing stop (or 1:2)."
+#property description "Filters: high-impact news, London/New York sessions, HTF trend. Wed/Thu/Fri only, weekly close Sat 04:30."
 
 #include <Trade\Trade.mqh>
 
@@ -57,7 +69,29 @@ enum ENUM_ZONE_MODE
 enum ENUM_SL_MODE
   {
    SL_OB_EXTREME = 0,      // Beyond the H4 order block (swing - recommended)
-   SL_M5_CANDLE  = 1       // Beyond the M5 rejection candle (tighter)
+   SL_M5_CANDLE  = 1       // Beyond the M5 rejection candle / ChoCH swing (tighter)
+  };
+
+enum ENUM_TP2_MODE
+  {
+   TP2_FIXED_RR      = 0,  // Fixed 1:RR target (no trailing)
+   TP2_ATR_TRAIL     = 1,  // ATR trailing stop after TP1 (no fixed target)
+   TP2_RR_PLUS_TRAIL = 2   // 1:RR target + ATR trailing stop after TP1
+  };
+
+enum ENUM_TREND_MODE
+  {
+   TREND_OFF              = 0, // Off (trade both directions)
+   TREND_MA               = 1, // Moving average (price vs MA + slope)
+   TREND_STRUCTURE        = 2, // Market structure (HH/HL vs LH/LL)
+   TREND_MA_AND_STRUCTURE = 3  // MA and structure must agree
+  };
+
+enum ENUM_ENTRY_CONFIRM
+  {
+   CONFIRM_REJECTION       = 0, // Rejection candle only (pin bar / engulfing)
+   CONFIRM_CHOCH           = 1, // M5 ChoCH / structure break only
+   CONFIRM_REJECTION_CHOCH = 2  // Rejection candle + M5 ChoCH (strictest)
   };
 
 //+------------------------------------------------------------------+
@@ -81,10 +115,43 @@ input double          InpLocalGMTOffset       = 5.5;             // My local GMT
 input int             InpCloseHour            = 4;               // Weekly close hour (Saturday)
 input int             InpCloseMinute          = 30;              // Weekly close minute (Saturday)
 input int             InpCloseBeforeMarketMin = 15;              // If Saturday close is after market close: close N min before Friday close
-input double          InpTesterBrokerGMT      = 2.0;             // Broker GMT offset used in Strategy Tester (live = auto)
+input double          InpTesterBrokerGMT      = 2.0;             // Tester: broker GMT offset in winter (live = auto)
+input bool            InpTesterUSDST          = true;            // Tester: broker adds +1h during US summer time
 input int             InpFallbackCloseHour    = 23;              // Fallback Friday market close hour (server) if unknown
 input int             InpFallbackCloseMin     = 55;              // Fallback Friday market close minute (server)
 input bool            InpCloseStale           = true;            // Close trades left over from a previous week
+
+input group "=== Market session filter (London / New York) ==="
+input bool            InpUseSessionFilter     = true;            // Only enter during the selected sessions
+input bool            InpSessLondon           = true;            // London session
+input int             InpLondonStartHour      = 8;               // London start hour (London local time)
+input int             InpLondonEndHour        = 17;              // London end hour (London local time)
+input bool            InpSessNewYork          = true;            // New York session
+input int             InpNYStartHour          = 8;               // New York start hour (New York local time)
+input int             InpNYEndHour            = 17;              // New York end hour (New York local time)
+input bool            InpSessAsia             = false;           // Asian session (Tokyo)
+input int             InpAsiaStartHour        = 9;               // Asia start hour (Tokyo local time)
+input int             InpAsiaEndHour          = 18;              // Asia end hour (Tokyo local time)
+
+input group "=== High-impact news filter ==="
+input bool            InpUseNewsFilter        = true;            // Pause new entries around high-impact news
+input string          InpNewsCurrencies       = "USD";           // News currencies (comma separated, e.g. USD,EUR)
+input bool            InpNewsIncludeMedium    = false;           // Also pause for medium-impact news
+input int             InpNewsMinsBefore       = 30;              // Pause minutes BEFORE the news
+input int             InpNewsMinsAfter        = 30;              // Pause minutes AFTER the news
+input string          InpNewsKeywords         = "";              // Only events containing (comma separated, empty = all)
+input bool            InpNewsNFPRule          = true;            // No calendar (tester): block NFP, 1st Friday 08:30 New York
+input string          InpNewsManualTimes      = "";              // Extra news, server time: 2026.11.06 15:30;2026.11.12 15:30
+
+input group "=== HTF trend filter ==="
+input ENUM_TREND_MODE InpTrendMode            = TREND_MA;        // Trend filter mode
+input ENUM_TIMEFRAMES InpTrendTF              = PERIOD_D1;       // Trend timeframe (D1 or W1)
+input int             InpTrendMAPeriod        = 50;              // Trend MA period
+input ENUM_MA_METHOD  InpTrendMAMethod        = MODE_EMA;        // Trend MA method
+input int             InpTrendSlopeBars       = 5;               // MA must slope over N bars (0 = no slope check)
+input int             InpTrendSwingBars       = 3;               // Structure: swing strength (bars each side)
+input int             InpTrendLookback        = 150;             // Structure: bars to scan
+input bool            InpTrendBlockNeutral    = true;            // No trades when the trend is neutral / mixed
 
 input group "=== D1 liquidity zones (Friday + Monday + Tuesday) ==="
 input ENUM_ZONE_MODE  InpZoneMode             = ZONE_PERCENT;    // How to size the sell / buy zones
@@ -101,13 +168,17 @@ input double          InpOBMinImpulseATR      = 1.0;             // Minimum disp
 input bool            InpOBRequireBOS         = true;            // Displacement must close beyond the OB candle
 input int             InpMaxOBsPerSide        = 5;               // Max order blocks tracked per side
 
-input group "=== M5 entry (rejection / wick candle) ==="
+input group "=== M5 entry (rejection candle + ChoCH) ==="
+input ENUM_ENTRY_CONFIRM InpEntryConfirm      = CONFIRM_REJECTION_CHOCH; // Entry confirmation
+input int             InpChochSwingBars       = 2;               // ChoCH: M5 swing strength (bars each side)
+input int             InpChochWindow          = 48;              // ChoCH: max M5 bars from OB touch to the break
+input int             InpChochSwingLookback   = 30;              // ChoCH: M5 bars searched for the swing before the touch
 input bool            InpUsePinBar            = true;            // Pin bar / long-wick rejection candle
 input double          InpPinMinWickPct        = 50.0;            // Rejection wick >= % of candle range
 input double          InpPinMaxBodyPct        = 40.0;            // Candle body <= % of candle range
 input bool            InpUseEngulfing         = true;            // Engulfing rejection candle
 input double          InpMinCandleATR         = 0.30;            // Signal candle range >= x M5 ATR
-input bool            InpRequireConfirm       = false;           // Wait for the next M5 candle to break the rejection candle
+input bool            InpRequireConfirm       = false;           // Rejection-only mode: next M5 candle must break the rejection candle
 
 input group "=== Risk & targets ==="
 input ENUM_LOT_MODE   InpLotMode              = LOT_RISK_PERCENT; // Lot sizing mode
@@ -115,7 +186,13 @@ input double          InpRiskPercent          = 1.0;             // Total risk p
 input double          InpFixedLot             = 0.01;            // Fixed lot per trade (fixed mode)
 input double          InpPartialLegPct        = 50.0;            // % of the setup volume on the TP1 (partial) trade
 input double          InpMaxRiskPercent       = 3.0;             // Skip if min-lot rounding pushes risk above this %
-input double          InpRewardRisk           = 2.0;             // Full TP (TP2) risk:reward
+input double          InpRewardRisk           = 2.0;             // TP2 risk:reward (fixed target / TP1 reference)
+input ENUM_TP2_MODE   InpTP2Mode              = TP2_ATR_TRAIL;   // TP2 trade exit
+input ENUM_TIMEFRAMES InpTrailTF              = PERIOD_H1;       // Trailing ATR timeframe
+input int             InpTrailATRPeriod       = 14;              // Trailing ATR period
+input double          InpTrailATRMult         = 2.0;             // Trailing distance (x ATR)
+input double          InpTrailStep            = 1.00;            // Minimum SL improvement per trail move (price, $)
+input double          InpTrailHardTPRR        = 0.0;             // ATR-trail mode: optional far TP in R (0 = none)
 input double          InpMinPartialRR         = 0.5;             // Tuesday 50% must be at least this R away from entry
 input double          InpFallbackPartialRR    = 1.0;             // TP1 at this R when the Tuesday 50% is not usable
 input ENUM_SL_MODE    InpSLMode               = SL_OB_EXTREME;   // Stop loss placement
@@ -147,6 +224,8 @@ input bool            InpTgScreenshot         = true;            // Attach chart
 input bool            InpTgCommands           = true;            // Answer /status /zones /report /chart /help
 input int             InpTgPollSeconds        = 10;              // Command polling interval (seconds)
 input bool            InpTgNotifyOB           = true;            // Message when a new H4 order block is mapped
+input bool            InpTgNewsAlerts         = true;            // Message when a news pause starts
+input bool            InpTgNotifyTrail        = false;           // Message on every trailing stop move
 input bool            InpTgDailyReport        = true;            // Send a daily report (Mon-Fri)
 input int             InpTgDailyHour          = 23;              // Daily report hour (server time)
 input int             InpTgDailyMinute        = 0;               // Daily report minute (server time)
@@ -201,12 +280,20 @@ struct SStats
    double            net;
   };
 
+struct SNewsEvent
+  {
+   datetime          time;           // server time
+   string            name;
+   string            currency;
+   bool              high;           // high impact (false = medium)
+  };
+
 //+------------------------------------------------------------------+
 //| Globals                                                          |
 //+------------------------------------------------------------------+
 const string   g_pfx     = "LSW_";
 const string   g_eaName  = "XAU Liquidity Swing EA";
-const string   g_eaVer   = "1.00";
+const string   g_eaVer   = "2.00";
 
 CTrade         g_tradeP;                 // TP1 / partial trade (magic)
 CTrade         g_tradeR;                 // TP2 / full trade (magic + 1)
@@ -218,6 +305,14 @@ long           g_magicR            = 0;
 int            g_hAtrD1            = INVALID_HANDLE;
 int            g_hAtrH4            = INVALID_HANDLE;
 int            g_hAtrM5            = INVALID_HANDLE;
+int            g_hAtrTrail         = INVALID_HANDLE;
+int            g_hTrendMA          = INVALID_HANDLE;
+SNewsEvent     g_news[];
+datetime       g_newsLoaded        = 0;
+bool           g_newsCalendarOk    = false;
+datetime       g_lastNewsAlert     = 0;
+ulong          g_trailTickets[];
+int            g_trendDir          = 0;
 datetime       g_curWeekStart      = 0;
 datetime       g_lastH4Bar         = 0;
 datetime       g_lastM5Bar         = 0;
@@ -419,15 +514,160 @@ void PushLine(string &arr[], const string s)
    arr[n] = s;
   }
 
+string TFText(const ENUM_TIMEFRAMES tf)
+  {
+   string s = EnumToString(tf);
+   if(StringFind(s, "PERIOD_") == 0)
+      s = StringSubstr(s, 7);
+   return s;
+  }
+
+//--- swing (fractal) points on a series-ordered rates array: k bars on each side
+bool IsSwingHigh(const MqlRates &r[], const int j, const int k)
+  {
+   for(int i = 1; i <= k; i++)
+      if(r[j - i].high >= r[j].high || r[j + i].high > r[j].high)
+         return false;
+   return true;
+  }
+
+bool IsSwingLow(const MqlRates &r[], const int j, const int k)
+  {
+   for(int i = 1; i <= k; i++)
+      if(r[j - i].low <= r[j].low || r[j + i].low < r[j].low)
+         return false;
+   return true;
+  }
+
 //+------------------------------------------------------------------+
 //| Weekly close time                                                |
 //+------------------------------------------------------------------+
-int BrokerGMTOffsetSec(void)
+datetime MakeDate(const int y, const int m, const int d, const int h, const int mi)
   {
-   if(g_isTester)
-      return (int)MathRound(InpTesterBrokerGMT * 3600.0);
-   long diff = (long)TimeTradeServer() - (long)TimeGMT();
-   return (int)(MathRound((double)diff / 900.0) * 900.0);
+   MqlDateTime s;
+   ZeroMemory(s);
+   s.year = y;
+   s.mon  = m;
+   s.day  = d;
+   s.hour = h;
+   s.min  = mi;
+   s.sec  = 0;
+   return StructToTime(s);
+  }
+
+//--- n >= 1: n-th Sunday of the month, n <= 0: last Sunday of the month (00:00)
+datetime NthSunday(const int y, const int m, const int n)
+  {
+   if(n >= 1)
+     {
+      int dow = DowOf(MakeDate(y, m, 1, 0, 0));
+      return MakeDate(y, m, 1 + (7 - dow) % 7 + (n - 1) * 7, 0, 0);
+     }
+   int ny = (m == 12) ? y + 1 : y;
+   int nm = (m == 12) ? 1 : m + 1;
+   datetime last = (datetime)((long)MakeDate(ny, nm, 1, 0, 0) - 86400);
+   return (datetime)((long)last - (long)DowOf(last) * 86400);
+  }
+
+//--- US summer time: 2nd Sunday of March 02:00 EST -> 1st Sunday of November 02:00 EDT
+bool IsUSDST(const datetime gmt)
+  {
+   MqlDateTime d;
+   TimeToStruct(gmt, d);
+   long start = (long)NthSunday(d.year, 3, 2) + 7 * 3600;
+   long end   = (long)NthSunday(d.year, 11, 1) + 6 * 3600;
+   return ((long)gmt >= start && (long)gmt < end);
+  }
+
+//--- UK summer time: last Sunday of March 01:00 GMT -> last Sunday of October 01:00 GMT
+bool IsUKDST(const datetime gmt)
+  {
+   MqlDateTime d;
+   TimeToStruct(gmt, d);
+   long start = (long)NthSunday(d.year, 3, 0) + 3600;
+   long end   = (long)NthSunday(d.year, 10, 0) + 3600;
+   return ((long)gmt >= start && (long)gmt < end);
+  }
+
+//--- broker server offset from GMT (seconds). Live: measured. Tester: inputs (+ US DST rule).
+int BrokerOffsetAt(const datetime serverTime)
+  {
+   if(!g_isTester)
+     {
+      long diff = (long)TimeTradeServer() - (long)TimeGMT();
+      return (int)(MathRound((double)diff / 900.0) * 900.0);
+     }
+   int off = (int)MathRound(InpTesterBrokerGMT * 3600.0);
+   if(InpTesterUSDST && IsUSDST((datetime)((long)serverTime - off)))
+      off += 3600;
+   return off;
+  }
+
+datetime ServerToGMT(const datetime serverTime)
+  {
+   return (datetime)((long)serverTime - BrokerOffsetAt(serverTime));
+  }
+
+datetime GMTToServer(const datetime gmt)
+  {
+   int off = BrokerOffsetAt((datetime)((long)gmt + (long)MathRound(InpTesterBrokerGMT * 3600.0)));
+   return (datetime)((long)gmt + off);
+  }
+
+bool InHourWindow(const datetime localTime, const int startH, const int endH)
+  {
+   int m = MinuteOfDay(localTime);
+   int s = startH * 60, e = endH * 60;
+   if(s == e)
+      return true;
+   if(s < e)
+      return (m >= s && m < e);
+   return (m >= s || m < e);                 // window crosses midnight
+  }
+
+//+------------------------------------------------------------------+
+//| Market session filter (London / New York / Asia)                 |
+//+------------------------------------------------------------------+
+bool SessionAllows(const datetime serverNow, string &label)
+  {
+   datetime gmt = ServerToGMT(serverNow);
+   bool ok = false;
+   label = "";
+   if(InpSessLondon)
+     {
+      datetime lon = (datetime)((long)gmt + (IsUKDST(gmt) ? 3600 : 0));
+      if(InHourWindow(lon, InpLondonStartHour, InpLondonEndHour))
+        {
+         ok = true;
+         label = "London";
+        }
+     }
+   if(InpSessNewYork)
+     {
+      datetime nyc = (datetime)((long)gmt - 5 * 3600 + (IsUSDST(gmt) ? 3600 : 0));
+      if(InHourWindow(nyc, InpNYStartHour, InpNYEndHour))
+        {
+         ok = true;
+         label = (label == "") ? "New York" : label + " + New York";
+        }
+     }
+   if(InpSessAsia)
+     {
+      datetime tky = (datetime)((long)gmt + 9 * 3600);
+      if(InHourWindow(tky, InpAsiaStartHour, InpAsiaEndHour))
+        {
+         ok = true;
+         label = (label == "") ? "Asia" : label + " + Asia";
+        }
+     }
+   if(!InpUseSessionFilter)
+     {
+      label = (label == "") ? "filter off" : label + " (filter off)";
+      return true;
+     }
+   if(!ok)
+      label = "closed (outside the selected sessions)";
+   return ok;
   }
 
 datetime FridayMarketClose(const datetime weekStart)
@@ -450,7 +690,7 @@ void ComputeCloseTimes(const datetime weekStart)
   {
    long target = (long)weekStart + 5 * 86400 + (long)InpCloseHour * 3600 + (long)InpCloseMinute * 60;
    if(InpCloseTimeZone == CLOSE_TZ_LOCAL)
-      target += (long)BrokerGMTOffsetSec() - (long)MathRound(InpLocalGMTOffset * 3600.0);
+      target += (long)BrokerOffsetAt((datetime)target) - (long)MathRound(InpLocalGMTOffset * 3600.0);
    g_closeTarget = (datetime)target;
    datetime mkt = (datetime)((long)FridayMarketClose(weekStart) - (long)InpCloseBeforeMarketMin * 60);
    g_closeEffective = (g_closeTarget < mkt) ? g_closeTarget : mkt;
@@ -469,6 +709,320 @@ void EnsureWeek(const datetime now)
    g_closeFailNotified = false;
    ComputeCloseTimes(ws);
    g_status = "New week " + TimeToString(ws, TIME_DATE) + ": Fri/Mon/Tue liquidity forming";
+  }
+
+//+------------------------------------------------------------------+
+//| High-impact news filter                                          |
+//+------------------------------------------------------------------+
+void PushNews(const datetime t, const string name, const string cur, const bool high)
+  {
+   int n = ArraySize(g_news);
+   ArrayResize(g_news, n + 1);
+   g_news[n].time     = t;
+   g_news[n].name     = name;
+   g_news[n].currency = cur;
+   g_news[n].high     = high;
+  }
+
+bool NewsKeywordMatch(const string eventName)
+  {
+   string kw = InpNewsKeywords;
+   StringTrimLeft(kw);
+   StringTrimRight(kw);
+   if(kw == "")
+      return true;
+   string name = eventName;
+   StringToLower(name);
+   string parts[];
+   int n = StringSplit(kw, ',', parts);
+   for(int i = 0; i < n; i++)
+     {
+      string p = parts[i];
+      StringTrimLeft(p);
+      StringTrimRight(p);
+      StringToLower(p);
+      if(p != "" && StringFind(name, p) >= 0)
+         return true;
+     }
+   return false;
+  }
+
+//--- MT5 economic calendar (live terminal only - not available in the Strategy Tester)
+bool LoadCalendarNews(const datetime now)
+  {
+   string cur[];
+   int nc = StringSplit(InpNewsCurrencies, ',', cur);
+   if(nc <= 0)
+      return false;
+   datetime from = (datetime)((long)now - 86400);
+   datetime to   = (datetime)((long)now + 8 * 86400);
+   int total = 0;
+   for(int c = 0; c < nc; c++)
+     {
+      string code = cur[c];
+      StringTrimLeft(code);
+      StringTrimRight(code);
+      StringToUpper(code);
+      if(code == "")
+         continue;
+      MqlCalendarValue vals[];
+      ResetLastError();
+      CalendarValueHistory(vals, from, to, NULL, code);
+      if(GetLastError() != 0)
+         continue;
+      int n = ArraySize(vals);
+      total += n;
+      for(int i = 0; i < n; i++)
+        {
+         MqlCalendarEvent ev;
+         if(!CalendarEventById(vals[i].event_id, ev))
+            continue;
+         if(ev.time_mode != CALENDAR_TIMEMODE_DATETIME)
+            continue;
+         bool high = (ev.importance == CALENDAR_IMPORTANCE_HIGH);
+         bool med  = (ev.importance == CALENDAR_IMPORTANCE_MODERATE);
+         if(!high && !(InpNewsIncludeMedium && med))
+            continue;
+         if(!NewsKeywordMatch(ev.name))
+            continue;
+         PushNews(vals[i].time, ev.name, code, high);
+        }
+     }
+   return (total > 0);                       // an empty calendar = not synchronised yet
+  }
+
+//--- Non-Farm Payrolls: first Friday of the month, 08:30 New York time
+void AddNFPRule(const datetime now)
+  {
+   MqlDateTime d;
+   TimeToStruct(now, d);
+   for(int k = -1; k <= 1; k++)
+     {
+      int m = d.mon + k, y = d.year;
+      if(m < 1)
+        {
+         m += 12;
+         y--;
+        }
+      if(m > 12)
+        {
+         m -= 12;
+         y++;
+        }
+      int dow = DowOf(MakeDate(y, m, 1, 0, 0));
+      int day = 1 + (5 - dow + 7) % 7;
+      datetime gmt = MakeDate(y, m, day, 13, 30);              // 08:30 EST = 13:30 GMT
+      if(IsUSDST(gmt))
+         gmt = (datetime)((long)gmt - 3600);                  // 08:30 EDT = 12:30 GMT
+      PushNews(GMTToServer(gmt), "Non-Farm Payrolls (rule)", "USD", true);
+     }
+  }
+
+void AddManualNews(void)
+  {
+   string s = InpNewsManualTimes;
+   StringTrimLeft(s);
+   StringTrimRight(s);
+   if(s == "")
+      return;
+   string parts[];
+   int n = StringSplit(s, ';', parts);
+   for(int i = 0; i < n; i++)
+     {
+      string p = parts[i];
+      StringTrimLeft(p);
+      StringTrimRight(p);
+      if(p == "")
+         continue;
+      datetime t = StringToTime(p);
+      if(t > 0)
+         PushNews(t, "Manual news", "", true);
+     }
+  }
+
+void RefreshNews(const datetime now)
+  {
+   if(!InpUseNewsFilter)
+      return;
+   long every = (!g_isTester && !g_newsCalendarOk) ? 300 : 3600;   // retry quickly while the calendar is not ready
+   if(g_newsLoaded > 0 && (long)now >= (long)g_newsLoaded && (long)now - (long)g_newsLoaded < every)
+      return;
+   g_newsLoaded = now;
+   ArrayResize(g_news, 0);
+   AddManualNews();
+   g_newsCalendarOk = (!g_isTester && LoadCalendarNews(now));
+   if(!g_newsCalendarOk && InpNewsNFPRule)
+      AddNFPRule(now);
+  }
+
+//--- index of the news event that blocks entries at 'now', -1 if none
+int BlockingNews(const datetime now)
+  {
+   if(!InpUseNewsFilter)
+      return -1;
+   for(int i = 0; i < ArraySize(g_news); i++)
+     {
+      long t = (long)g_news[i].time;
+      if((long)now >= t - (long)InpNewsMinsBefore * 60 && (long)now <= t + (long)InpNewsMinsAfter * 60)
+         return i;
+     }
+   return -1;
+  }
+
+string NewsLine(const int i)
+  {
+   string imp = g_news[i].high ? "HIGH" : "MED";
+   string cur = (g_news[i].currency == "") ? "" : g_news[i].currency + " ";
+   return DayTime(g_news[i].time) + "  " + cur + g_news[i].name + " [" + imp + "]";
+  }
+
+string UpcomingNewsText(const datetime now, const int hours)
+  {
+   string s = "";
+   int cnt = 0;
+   for(int i = 0; i < ArraySize(g_news); i++)
+     {
+      long t = (long)g_news[i].time;
+      if(t >= (long)now - (long)InpNewsMinsAfter * 60 && t <= (long)now + (long)hours * 3600)
+        {
+         s += " - " + NewsLine(i) + "\n";
+         cnt++;
+        }
+     }
+   if(cnt == 0)
+      s = " - none\n";
+   return s;
+  }
+
+string NewsSourceText(void)
+  {
+   if(!InpUseNewsFilter)
+      return "off";
+   if(g_newsCalendarOk)
+      return "MT5 economic calendar";
+   return InpNewsNFPRule ? "NFP rule + manual list (no calendar)" : "manual list (no calendar)";
+  }
+
+void NewsAlertCheck(const datetime now)
+  {
+   if(!InpUseNewsFilter || !InpTgNewsAlerts || !InpTelegramEnable)
+      return;
+   int dow = DowOf(now);
+   bool tradeDay = (dow == 3 && InpTradeWednesday) || (dow == 4 && InpTradeThursday) || (dow == 5 && InpTradeFriday);
+   if(!tradeDay)
+      return;
+   int i = BlockingNews(now);
+   if(i < 0 || g_news[i].time == g_lastNewsAlert)
+      return;
+   g_lastNewsAlert = g_news[i].time;
+   datetime until = (datetime)((long)g_news[i].time + (long)InpNewsMinsAfter * 60);
+   TgSend(E_Warn() + " NEWS PAUSE - " + _Symbol + "\n" + NewsLine(i) + "\n"
+          + "No new entries until " + DayTime(until) + " (server). Open trades keep their SL / TP.");
+  }
+
+//+------------------------------------------------------------------+
+//| HTF trend filter                                                 |
+//+------------------------------------------------------------------+
+int MATrend(void)
+  {
+   if(g_hTrendMA == INVALID_HANDLE)
+      return 0;
+   int slope = (InpTrendSlopeBars > 0) ? InpTrendSlopeBars : 0;
+   int need  = slope + 1;
+   double ma[];
+   ArraySetAsSeries(ma, true);
+   if(CopyBuffer(g_hTrendMA, 0, 1, need, ma) < need)
+      return 0;
+   MqlRates r[];
+   ArraySetAsSeries(r, true);
+   if(CopyRates(_Symbol, InpTrendTF, 1, 1, r) < 1)
+      return 0;
+   double c = r[0].close;
+   bool slopeUp = (slope == 0) || (ma[0] > ma[slope]);
+   bool slopeDn = (slope == 0) || (ma[0] < ma[slope]);
+   if(c > ma[0] && slopeUp)
+      return 1;
+   if(c < ma[0] && slopeDn)
+      return -1;
+   return 0;
+  }
+
+int StructureTrend(void)
+  {
+   int k = (InpTrendSwingBars > 0) ? InpTrendSwingBars : 1;
+   MqlRates r[];
+   ArraySetAsSeries(r, true);
+   int n = CopyRates(_Symbol, InpTrendTF, 0, InpTrendLookback, r);
+   if(n < 2 * k + 6)
+      return 0;
+   double h1 = 0, h2 = 0, l1 = 0, l2 = 0;
+   int nh = 0, nl = 0;
+   for(int j = k + 1; j < n - k && (nh < 2 || nl < 2); j++)
+     {
+      if(nh < 2 && IsSwingHigh(r, j, k))
+        {
+         if(nh == 0)
+            h1 = r[j].high;
+         else
+            h2 = r[j].high;
+         nh++;
+        }
+      if(nl < 2 && IsSwingLow(r, j, k))
+        {
+         if(nl == 0)
+            l1 = r[j].low;
+         else
+            l2 = r[j].low;
+         nl++;
+        }
+     }
+   if(nh < 1 || nl < 1)
+      return 0;
+   if(r[1].close > h1)                       // bullish break of structure
+      return 1;
+   if(r[1].close < l1)                       // bearish break of structure
+      return -1;
+   if(nh < 2 || nl < 2)
+      return 0;
+   if(h1 > h2 && l1 > l2)                    // higher high + higher low
+      return 1;
+   if(h1 < h2 && l1 < l2)                    // lower high + lower low
+      return -1;
+   return 0;
+  }
+
+int TrendDir(void)
+  {
+   if(InpTrendMode == TREND_OFF)
+      return 0;
+   if(InpTrendMode == TREND_MA)
+      return MATrend();
+   if(InpTrendMode == TREND_STRUCTURE)
+      return StructureTrend();
+   int a = MATrend();
+   int b = StructureTrend();
+   return (a == b) ? a : 0;
+  }
+
+bool TrendAllows(const int dir, const int trend)
+  {
+   if(InpTrendMode == TREND_OFF)
+      return true;
+   if(trend == 0)
+      return !InpTrendBlockNeutral;
+   return (trend == dir);
+  }
+
+string TrendText(const int trend)
+  {
+   if(InpTrendMode == TREND_OFF)
+      return "filter off";
+   string tf = TFText(InpTrendTF);
+   if(trend > 0)
+      return tf + " UP (buys only)";
+   if(trend < 0)
+      return tf + " DOWN (sells only)";
+   return tf + " NEUTRAL" + (InpTrendBlockNeutral ? " (no trades)" : " (both sides)");
   }
 
 //+------------------------------------------------------------------+
@@ -1048,6 +1602,18 @@ bool CanOpenNewSetup(string &why)
       why = "Too close to the weekly close";
       return false;
      }
+   string sess = "";
+   if(!SessionAllows(now, sess))
+     {
+      why = "Session filter: " + sess;
+      return false;
+     }
+   int ni = BlockingNews(now);
+   if(ni >= 0)
+     {
+      why = "News pause: " + g_news[ni].name + " at " + TimeToString(g_news[ni].time, TIME_MINUTES);
+      return false;
+     }
    int setups = SetupsThisWeek();
    if(setups >= InpMaxSetupsPerWeek)
      {
@@ -1074,11 +1640,124 @@ bool CanOpenNewSetup(string &why)
    return true;
   }
 
+//+------------------------------------------------------------------+
+//| M5 ChoCH / market structure break after the OB touch             |
+//|  SELL: price taps the bearish OB (sweep high), then an M5 candle |
+//|        closes below the last swing low formed before the tap.    |
+//|  BUY : mirror image. Only the FIRST break after the tap counts.  |
+//+------------------------------------------------------------------+
+bool CheckChoch(const SOrderBlock &ob, const MqlRates &m5[], const int count, const double atr,
+                string &pattern, double &sweepExt, double &level)
+  {
+   int k = (InpChochSwingBars > 0) ? InpChochSwingBars : 1;
+   int maxW = InpChochWindow;
+   if(maxW > count - InpChochSwingLookback - k - 3)
+      maxW = count - InpChochSwingLookback - k - 3;
+   if(maxW < 1)
+      return false;
+   bool isSell = (ob.dir < 0);
+
+   //--- 1. the tap: most extreme M5 candle inside the OB within the window
+   int p = -1;
+   for(int s = 1; s <= maxW; s++)
+     {
+      if(!(m5[s].high >= ob.low && m5[s].low <= ob.high))
+         continue;
+      if(p < 0 || (isSell && m5[s].high > m5[p].high) || (!isSell && m5[s].low < m5[p].low))
+         p = s;
+     }
+   if(p < 0)
+      return false;
+
+   //--- 2. the swing that must break: last swing low (sell) / high (buy) formed before the tap
+   bool found = false;
+   int jStart = (p + 1 > k + 1) ? p + 1 : k + 1;
+   for(int j = jStart; j <= p + InpChochSwingLookback && j + k < count; j++)
+     {
+      if(isSell && IsSwingLow(m5, j, k))
+        {
+         level = m5[j].low;
+         found = true;
+         break;
+        }
+      if(!isSell && IsSwingHigh(m5, j, k))
+        {
+         level = m5[j].high;
+         found = true;
+         break;
+        }
+     }
+   if(!found)
+      return false;
+
+   //--- 3. the break: the last closed candle closes beyond the swing, first time since the tap
+   if(isSell ? !(m5[1].close < level) : !(m5[1].close > level))
+      return false;
+   for(int s2 = 2; s2 <= p; s2++)
+      if(isSell ? (m5[s2].close < level) : (m5[s2].close > level))
+         return false;                       // the break already happened earlier
+
+   sweepExt = isSell ? m5[p].high : m5[p].low;
+   string side = isSell ? "below swing low " : "above swing high ";
+   pattern  = "ChoCH: M5 close " + side + P2S(level) + " after the OB tap at " + P2S(sweepExt);
+
+   //--- 4. optional: a rejection candle between the tap and the break
+   if(InpEntryConfirm == CONFIRM_REJECTION_CHOCH)
+     {
+      bool rej = false;
+      string rp = "";
+      for(int s3 = 1; s3 <= p && !rej; s3++)
+         rej = IsRejection(ob, m5, s3, atr, rp);
+      if(!rej)
+         return false;
+      pattern = rp + " + " + pattern;
+     }
+   return true;
+  }
+
+//--- entry signal for one order block: fills the SL anchor (candle / structure extreme) and the arrow position
+bool FindEntrySignal(const int idx, const MqlRates &m5[], const int count, const double atr,
+                     string &pattern, double &ext, datetime &sigTime, double &sigPrice)
+  {
+   bool isSell = (g_obs[idx].dir < 0);
+   if(InpEntryConfirm == CONFIRM_REJECTION)
+     {
+      int sig = InpRequireConfirm ? 2 : 1;
+      if(!IsRejection(g_obs[idx], m5, sig, atr, pattern))
+         return false;
+      ext = isSell ? m5[sig].high : m5[sig].low;
+      if(InpRequireConfirm)
+        {
+         if(isSell && !(m5[1].close < m5[2].low))
+            return false;
+         if(!isSell && !(m5[1].close > m5[2].high))
+            return false;
+         pattern += " + confirmation candle";
+         ext = isSell ? MathMax(ext, m5[1].high) : MathMin(ext, m5[1].low);
+        }
+      sigTime  = m5[sig].time;
+      sigPrice = ext;
+      return true;
+     }
+   double sweep = 0.0, level = 0.0;
+   if(!CheckChoch(g_obs[idx], m5, count, atr, pattern, sweep, level))
+      return false;
+   ext      = sweep;
+   sigTime  = m5[1].time;
+   sigPrice = isSell ? m5[1].high : m5[1].low;
+   return true;
+  }
+
 void CheckEntries(void)
   {
+   int k    = (InpChochSwingBars > 0) ? InpChochSwingBars : 1;
+   int need = InpChochWindow + InpChochSwingLookback + k + 6;
+   if(need < 8)
+      need = 8;
    MqlRates m5[];
    ArraySetAsSeries(m5, true);
-   if(CopyRates(_Symbol, PERIOD_M5, 0, 6, m5) < 6)
+   int count = CopyRates(_Symbol, PERIOD_M5, 0, need, m5);
+   if(count < 6)
       return;
 
    //--- an M5 close through the order block invalidates it
@@ -1103,40 +1782,47 @@ void CheckEntries(void)
    double atrM5 = GetATR(g_hAtrM5, 1);
    if(atrM5 <= 0)
       atrM5 = m5[1].high - m5[1].low;
-   int sig = InpRequireConfirm ? 2 : 1;
+   g_trendDir = TrendDir();
 
-   int active = 0;
+   int active = 0, againstTrend = 0;
    for(int i = 0; i < ArraySize(g_obs); i++)
       if(g_obs[i].valid && !g_obs[i].used)
+        {
          active++;
+         if(!TrendAllows(g_obs[i].dir, g_trendDir))
+            againstTrend++;
+        }
    if(active == 0)
      {
       g_status = "Watching: no active H4 order block inside the D1 zones";
       return;
      }
-   g_status = "Watching " + IntegerToString(active) + " H4 OB(s) for an M5 rejection candle";
+   if(againstTrend == active)
+     {
+      g_status = "HTF trend " + TrendText(g_trendDir) + ": active OB(s) are against the trend";
+      return;
+     }
+   string confirmTxt = (InpEntryConfirm == CONFIRM_REJECTION) ? "rejection candle"
+                       : (InpEntryConfirm == CONFIRM_CHOCH ? "ChoCH" : "rejection + ChoCH");
+   g_status = "Watching " + IntegerToString(active - againstTrend) + " H4 OB(s) for an M5 " + confirmTxt;
 
    for(int i = 0; i < ArraySize(g_obs); i++)
      {
       if(!g_obs[i].valid || g_obs[i].used)
          continue;
-      string pattern = "";
-      if(!IsRejection(g_obs[i], m5, sig, atrM5, pattern))
+      if(!TrendAllows(g_obs[i].dir, g_trendDir))
          continue;
-      if(InpRequireConfirm)
-        {
-         if(g_obs[i].dir < 0 && !(m5[1].close < m5[2].low))
-            continue;
-         if(g_obs[i].dir > 0 && !(m5[1].close > m5[2].high))
-            continue;
-         pattern += " + confirmation candle";
-        }
+      string pattern = "";
+      double ext = 0.0, sigPrice = 0.0;
+      datetime sigTime = 0;
+      if(!FindEntrySignal(i, m5, count, atrM5, pattern, ext, sigTime, sigPrice))
+         continue;
       if(InpRequireSweep && !LiquiditySwept(g_obs[i].dir))
         {
-         g_status = "Rejection seen but the Fri/Mon/Tue liquidity is not swept yet";
+         g_status = "Signal seen but the Fri/Mon/Tue liquidity is not swept yet";
          continue;
         }
-      if(OpenSetup(i, m5, sig, pattern))
+      if(OpenSetup(i, ext, sigTime, sigPrice, pattern))
         {
          g_obs[i].used = true;
          DrawOB(g_obs[i]);
@@ -1233,7 +1919,56 @@ bool SendMarket(CTrade &t, const bool isSell, const double lots, const double sl
    return false;
   }
 
-bool OpenSetup(const int idx, const MqlRates &m5[], const int sig, const string pattern)
+string TrailText(void)
+  {
+   return TFText(InpTrailTF) + " ATR(" + IntegerToString(InpTrailATRPeriod) + ") x " + DoubleToString(InpTrailATRMult, 1);
+  }
+
+string TP2ModeText(void)
+  {
+   if(InpTP2Mode == TP2_FIXED_RR)
+      return "1:" + DoubleToString(InpRewardRisk, 1);
+   if(InpTP2Mode == TP2_ATR_TRAIL)
+      return "ATR trail (" + TrailText() + ")";
+   return "1:" + DoubleToString(InpRewardRisk, 1) + " + ATR trail (" + TrailText() + ")";
+  }
+
+string ConfirmModeText(void)
+  {
+   if(InpEntryConfirm == CONFIRM_REJECTION)
+      return "M5 rejection candle";
+   if(InpEntryConfirm == CONFIRM_CHOCH)
+      return "M5 ChoCH";
+   return "M5 rejection + ChoCH";
+  }
+
+string SessionSetupText(void)
+  {
+   if(!InpUseSessionFilter)
+      return "off";
+   string s = "";
+   if(InpSessLondon)
+      s += "London " + IntegerToString(InpLondonStartHour) + "-" + IntegerToString(InpLondonEndHour) + " ";
+   if(InpSessNewYork)
+      s += "NY " + IntegerToString(InpNYStartHour) + "-" + IntegerToString(InpNYEndHour) + " ";
+   if(InpSessAsia)
+      s += "Tokyo " + IntegerToString(InpAsiaStartHour) + "-" + IntegerToString(InpAsiaEndHour) + " ";
+   return s + "(local)";
+  }
+
+string FiltersStatusText(const datetime now)
+  {
+   string sess = "";
+   bool sOk = SessionAllows(now, sess);
+   int ni = BlockingNews(now);
+   string news = (!InpUseNewsFilter) ? "off" : (ni >= 0 ? "PAUSED - " + g_news[ni].name + " " + TimeToString(g_news[ni].time, TIME_MINUTES) : "clear");
+   string state = sOk ? "OPEN " : "CLOSED ";
+   return "Session: " + state + sess + "\n"
+          + "News: " + news + " (" + NewsSourceText() + ")\n"
+          + "HTF trend: " + TrendText(TrendDir()) + "\n";
+  }
+
+bool OpenSetup(const int idx, const double candleExt, const datetime sigTime, const double sigPrice, const string pattern)
   {
    bool isSell = (g_obs[idx].dir < 0);
    MqlTick tick;
@@ -1242,10 +1977,7 @@ bool OpenSetup(const int idx, const MqlRates &m5[], const int sig, const string 
    double spread = tick.ask - tick.bid;
    double entry  = isSell ? tick.bid : tick.ask;
 
-   //--- stop loss: beyond the H4 OB (or the M5 rejection candle) + buffer
-   double candleExt = isSell ? m5[sig].high : m5[sig].low;
-   if(sig == 2)
-      candleExt = isSell ? MathMax(candleExt, m5[1].high) : MathMin(candleExt, m5[1].low);
+   //--- stop loss: beyond the H4 OB (or the M5 rejection candle / ChoCH swing) + buffer
    double ext = candleExt;
    if(InpSLMode == SL_OB_EXTREME)
       ext = isSell ? MathMax(g_obs[idx].high, candleExt) : MathMin(g_obs[idx].low, candleExt);
@@ -1265,9 +1997,23 @@ bool OpenSetup(const int idx, const MqlRates &m5[], const int sig, const string 
       return false;
      }
 
-   //--- targets: TP2 = 1:RR, TP1 = Tuesday 50% (partial)
+   //--- targets: TP1 = Tuesday 50% (partial), TP2 = 1:RR and / or ATR trailing stop
    double fullDist = InpRewardRisk * risk;
    double tp2 = isSell ? entry - fullDist : entry + fullDist;
+   string tp2Txt = "1:" + DoubleToString(InpRewardRisk, 1);
+   if(InpTP2Mode == TP2_ATR_TRAIL)
+     {
+      tp2 = 0.0;
+      tp2Txt = "no fixed TP - ATR trailing stop after TP1 (" + TrailText() + ")";
+      if(InpTrailHardTPRR > 0)
+        {
+         tp2 = isSell ? entry - InpTrailHardTPRR * risk : entry + InpTrailHardTPRR * risk;
+         tp2Txt = "ATR trailing stop after TP1 (" + TrailText() + "), far TP 1:" + DoubleToString(InpTrailHardTPRR, 1);
+        }
+     }
+   else
+      if(InpTP2Mode == TP2_RR_PLUS_TRAIL)
+         tp2Txt += " + ATR trailing stop after TP1 (" + TrailText() + ")";
    double tp1 = 0.0;
    string tp1Src = "";
    if(g_week.hasTue && g_week.tueMid > 0)
@@ -1283,11 +2029,12 @@ bool OpenSetup(const int idx, const MqlRates &m5[], const int sig, const string 
      {
       double r = MathMin(InpFallbackPartialRR, InpRewardRisk);
       tp1    = isSell ? entry - r * risk : entry + r * risk;
-      tp1Src = DoubleToString(r, 1) + "R fallback - Tuesday 50% not between entry and TP2";
+      tp1Src = DoubleToString(r, 1) + "R fallback - Tuesday 50% not between entry and 1:" + DoubleToString(InpRewardRisk, 1);
      }
    sl  = NormPrice(sl);
    tp1 = NormPrice(tp1);
-   tp2 = NormPrice(tp2);
+   if(tp2 > 0)
+      tp2 = NormPrice(tp2);
 
    //--- volume
    double lotP = 0.0, lotR = 0.0, riskMoney = 0.0;
@@ -1342,28 +2089,32 @@ bool OpenSetup(const int idx, const MqlRates &m5[], const int sig, const string 
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
    double riskPct = (bal > 0) ? riskMoney / bal * 100.0 : 0.0;
 
-   DrawSignal(isSell, m5[sig].time, isSell ? m5[sig].high : m5[sig].low);
+   DrawSignal(isSell, sigTime, sigPrice);
 
+   string tp2Price = (tp2 > 0) ? P2S(tp2) : "trailing";
    string legs = "";
    if(g_netting)
       legs = E_Yellow() + " TP1 partial: " + P2S(tp1) + " (" + tp1Src + ", " + DoubleToString(rr1, 2) + "R) - EA closes " + L2S(lotP) + " lot\n"
-             + E_Target() + " TP2 full: " + P2S(tp2) + " (1:" + DoubleToString(InpRewardRisk, 1) + ") - total " + L2S(FloorLot(lotP + lotR)) + " lot\n";
+             + E_Target() + " TP2: " + tp2Price + " (" + tp2Txt + ") - total " + L2S(FloorLot(lotP + lotR)) + " lot\n";
    else
       legs = E_Yellow() + " Trade 1 TP1 partial: " + P2S(tp1) + " (" + tp1Src + ", " + DoubleToString(rr1, 2) + "R) | " + L2S(lotP) + " lot\n"
-             + E_Target() + " Trade 2 TP2 full: " + P2S(tp2) + " (1:" + DoubleToString(InpRewardRisk, 1) + ") | " + L2S(lotR) + " lot\n";
+             + E_Target() + " Trade 2 TP2: " + tp2Price + " (" + tp2Txt + ") | " + L2S(lotR) + " lot\n";
 
+   string sess = "";
+   SessionAllows(TimeCurrent(), sess);
    string msg = (isSell ? E_Down() : E_Up()) + " " + DirText(isSell) + " SETUP OPENED - " + _Symbol + "\n"
                 + "Signal: M5 " + pattern + "\n"
                 + "H4 OB: " + P2S(g_obs[idx].low) + " - " + P2S(g_obs[idx].high) + " in the D1 " + DirText(isSell) + " zone\n"
+                + "Filters: trend " + TrendText(g_trendDir) + " | session " + sess + " | news clear\n"
                 + "Entry: " + P2S(fill) + "\n"
                 + E_Stop() + " SL: " + P2S(sl) + " (" + P2S(risk) + " away)\n"
                 + legs
                 + "Risk: " + M2S(riskMoney) + " " + Currency() + " (" + DoubleToString(riskPct, 2) + "%)\n"
                 + E_Clock() + " Held until TP / SL or the weekly close " + DayTime(g_closeEffective) + " (server)"
                 + warn;
-   Print(DirText(isSell), " setup opened: entry ", P2S(fill), " SL ", P2S(sl), " TP1 ", P2S(tp1), " TP2 ", P2S(tp2));
+   Print(DirText(isSell), " setup opened: entry ", P2S(fill), " SL ", P2S(sl), " TP1 ", P2S(tp1), " TP2 ", tp2Price);
    TgSend(msg);
-   TgSendScreenshot(_Symbol + " " + DirText(isSell) + " entry @ " + P2S(fill) + " | SL " + P2S(sl) + " | TP1 " + P2S(tp1) + " | TP2 " + P2S(tp2));
+   TgSendScreenshot(_Symbol + " " + DirText(isSell) + " entry @ " + P2S(fill) + " | SL " + P2S(sl) + " | TP1 " + P2S(tp1) + " | TP2 " + tp2Price);
    g_status = DirText(isSell) + " setup running - holding until TP / SL or weekly close";
    return true;
   }
@@ -1427,9 +2178,123 @@ bool PartialTPHitSince(const datetime opened)
    return false;
   }
 
-void ManageBreakeven(void)
+bool TrailActive(const ulong ticket)
   {
-   if(!InpMoveRunnerToBE || g_netting)
+   for(int i = 0; i < ArraySize(g_trailTickets); i++)
+      if(g_trailTickets[i] == ticket)
+         return true;
+   return false;
+  }
+
+void ActivateTrail(const ulong ticket)
+  {
+   if(InpTP2Mode == TP2_FIXED_RR || TrailActive(ticket))
+      return;
+   int n = ArraySize(g_trailTickets);
+   ArrayResize(g_trailTickets, n + 1);
+   g_trailTickets[n] = ticket;
+   double atr = GetATR(g_hAtrTrail, 1);
+   TgSend(E_Shield() + " " + _Symbol + " TP1 done - ATR TRAILING STOP ACTIVE on the TP2 trade\n"
+          + "Trail: " + TrailText() + " = " + P2S(InpTrailATRMult * atr) + " behind price, step " + P2S(InpTrailStep));
+  }
+
+//--- trail one position: SL = price -/+ ATR x mult, never worse than breakeven (if enabled), only improves
+void TrailPosition(CTrade &t, const ulong ticket, const double dist, const MqlTick &tick, const double minDist)
+  {
+   if(!PositionSelectByTicket(ticket))
+      return;
+   bool isSell = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL);
+   double open = PositionGetDouble(POSITION_PRICE_OPEN);
+   double sl   = PositionGetDouble(POSITION_SL);
+   double tp   = PositionGetDouble(POSITION_TP);
+   double cand = isSell ? tick.ask + dist : tick.bid - dist;
+   if(InpMoveRunnerToBE)
+     {
+      double be = isSell ? open - InpBEOffset : open + InpBEOffset;
+      cand = isSell ? MathMin(cand, be) : MathMax(cand, be);
+     }
+   cand = NormPrice(cand);
+   bool improves = isSell ? (sl <= 0 || cand <= sl - InpTrailStep) : (cand >= sl + InpTrailStep);
+   if(!improves)
+      return;
+   if(isSell ? (cand <= tick.ask + minDist) : (cand >= tick.bid - minDist))
+      return;                                // too close to the market for the broker
+   if(!t.PositionModify(ticket, cand, tp))
+     {
+      Print("Trailing modify failed #", ticket, ": ", t.ResultRetcodeDescription());
+      return;
+     }
+   if(InpTgNotifyTrail)
+      TgSend(E_Shield() + " " + _Symbol + " trailing stop moved: SL " + P2S(cand)
+             + " (locked " + P2S(isSell ? open - cand : cand - open) + " from entry)");
+  }
+
+void ManageTrailing(void)
+  {
+   if(InpTP2Mode == TP2_FIXED_RR)
+      return;
+   ulong list[];
+   if(g_netting)
+     {
+      string gDone = GVName("vtp1done");
+      if(!GlobalVariableCheck(gDone) || GlobalVariableGet(gDone) < 0.5)
+         return;
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+         ulong tk = PositionGetTicket(i);
+         if(tk == 0)
+            continue;
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == g_magicP)
+           {
+            ArrayResize(list, 1);
+            list[0] = tk;
+            break;
+           }
+        }
+     }
+   else
+     {
+      //--- keep only runners that are still open
+      ulong keep[];
+      for(int i = 0; i < ArraySize(g_trailTickets); i++)
+         if(PositionSelectByTicket(g_trailTickets[i]))
+           {
+            int n = ArraySize(keep);
+            ArrayResize(keep, n + 1);
+            keep[n] = g_trailTickets[i];
+           }
+      ArrayResize(g_trailTickets, ArraySize(keep));
+      for(int i2 = 0; i2 < ArraySize(keep); i2++)
+        {
+         g_trailTickets[i2] = keep[i2];
+         ArrayResize(list, i2 + 1);
+         list[i2] = keep[i2];
+        }
+     }
+   if(ArraySize(list) == 0)
+      return;
+   double atr = GetATR(g_hAtrTrail, 1);
+   if(atr <= 0)
+      return;
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+   double dist    = InpTrailATRMult * atr;
+   double minDist = StopsDistance();
+   for(int j = 0; j < ArraySize(list); j++)
+     {
+      if(g_netting)
+         TrailPosition(g_tradeP, list[j], dist, tick, minDist);
+      else
+         TrailPosition(g_tradeR, list[j], dist, tick, minDist);
+     }
+  }
+
+//--- after TP1: breakeven and / or ATR trailing for the TP2 trade (hedging accounts)
+void ManageRunners(void)
+  {
+   bool trail = (InpTP2Mode != TP2_FIXED_RR);
+   if((!InpMoveRunnerToBE && !trail) || g_netting)
       return;
    int nP = 0, nR = 0;
    CountOurPositions(nP, nR);
@@ -1451,8 +2316,14 @@ void ManageBreakeven(void)
       times[n]   = PositionGetInteger(POSITION_TIME);
      }
    for(int j = 0; j < ArraySize(tickets); j++)
-      if(PartialTPHitSince((datetime)times[j]))
+     {
+      if(!TrailActive(tickets[j]) && !PartialTPHitSince((datetime)times[j]))
+         continue;
+      if(InpMoveRunnerToBE)
          MoveToBreakeven(g_tradeR, tickets[j]);
+      if(trail)
+         ActivateTrail(tickets[j]);
+     }
   }
 
 //--- netting accounts: one position, TP1 handled by the EA (partial close)
@@ -1508,6 +2379,8 @@ void ManageVirtualPartial(void)
       GlobalVariableSet(gDone, 1.0);
       if(InpMoveRunnerToBE)
          MoveToBreakeven(g_tradeP, ticket);
+      if(InpTP2Mode != TP2_FIXED_RR)
+         TgSend(E_Shield() + " " + _Symbol + " TP1 done - ATR TRAILING STOP ACTIVE on the remaining volume (" + TrailText() + ")");
      }
   }
 
@@ -1775,6 +2648,7 @@ void UpdatePanel(void)
             nBuy++;
         }
 
+   g_trendDir = TrendDir();
    string acc = g_netting ? "NETTING" : "HEDGING";
    string tg  = TgReady() ? "ON" : (InpTelegramEnable ? "check token / chat id" : "OFF");
    string L[];
@@ -1795,6 +2669,14 @@ void UpdatePanel(void)
             + "   open trades " + IntegerToString(open) + "   float " + SignedMoney(FloatingPL()));
    PushLine(L, "Week net " + SignedMoney(w.net) + " " + Currency());
    PushLine(L, "Weekly close " + DayTime(g_closeEffective));
+   string sess = "";
+   string sState = SessionAllows(now, sess) ? "OPEN " : "CLOSED ";
+   int ni = BlockingNews(now);
+   string news = (!InpUseNewsFilter) ? "off" : (ni >= 0 ? "PAUSED " + StringSubstr(g_news[ni].name, 0, 30) : "clear");
+   PushLine(L, "Session: " + sState + StringSubstr(sess, 0, 40));
+   PushLine(L, "News: " + news);
+   PushLine(L, "HTF trend: " + TrendText(g_trendDir));
+   PushLine(L, "Entry: " + ConfirmModeText() + " | TP2: " + StringSubstr(TP2ModeText(), 0, 30));
    PushLine(L, "Status: " + StringSubstr(g_status, 0, 58));
    PushLine(L, "Telegram: " + tg);
 
@@ -1806,7 +2688,7 @@ void UpdatePanel(void)
       ObjectSetInteger(0, bg, OBJPROP_CORNER, CORNER_LEFT_UPPER);
       ObjectSetInteger(0, bg, OBJPROP_XDISTANCE, 10);
       ObjectSetInteger(0, bg, OBJPROP_YDISTANCE, 24);
-      ObjectSetInteger(0, bg, OBJPROP_XSIZE, 440);
+      ObjectSetInteger(0, bg, OBJPROP_XSIZE, 490);
       ObjectSetInteger(0, bg, OBJPROP_BGCOLOR, C'18,20,26');
       ObjectSetInteger(0, bg, OBJPROP_BORDER_TYPE, BORDER_FLAT);
       ObjectSetInteger(0, bg, OBJPROP_COLOR, C'70,70,80');
@@ -2056,8 +2938,25 @@ string HelpText(void)
           + "/status - EA status, open trades, P/L\n"
           + "/zones - D1 liquidity zones, Tuesday 50% TP1, H4 order blocks\n"
           + "/report - today + this week results\n"
+          + "/news - upcoming high-impact news (48h)\n"
           + "/chart - chart screenshot\n"
           + "/help - this list";
+  }
+
+string BuildNewsText(void)
+  {
+   datetime now = ServerNow();
+   RefreshNews(now);
+   string s = E_Warn() + " HIGH-IMPACT NEWS - next 48h (server time)\n";
+   if(!InpUseNewsFilter)
+      return s + "News filter is OFF.";
+   s += "Source: " + NewsSourceText() + " | currencies " + InpNewsCurrencies + "\n";
+   s += "Entries paused " + IntegerToString(InpNewsMinsBefore) + " min before / " + IntegerToString(InpNewsMinsAfter) + " min after\n";
+   s += UpcomingNewsText(now, 48);
+   int ni = BlockingNews(now);
+   if(ni >= 0)
+      s += "NOW PAUSED: " + g_news[ni].name;
+   return s;
   }
 
 void TgHandleCommand(const string raw)
@@ -2081,6 +2980,9 @@ void TgHandleCommand(const string raw)
          if(cmd == "/report")
             TgSend(BuildDailyReport(DayStart(ServerNow())));
          else
+            if(cmd == "/news")
+               TgSend(BuildNewsText());
+            else
             if(cmd == "/chart")
                TgSendScreenshot(_Symbol + " - " + DayTime(ServerNow()) + " (server)");
             else
@@ -2157,8 +3059,10 @@ string BuildZonesText(void)
         + "  (liquidity low " + P2S(g_week.liqLow) + " " + DayName(g_week.liqLowDow) + ")\n";
    string tue = g_week.hasTue ? P2S(g_week.tueMid) : "n/a (fallback " + DoubleToString(InpFallbackPartialRR, 1) + "R)";
    s += E_Yellow() + " TP1 partial = Tuesday 50%: " + tue + "\n";
-   s += E_Target() + " TP2 full = 1:" + DoubleToString(InpRewardRisk, 1) + " risk reward\n";
+   s += E_Target() + " TP2 trade: " + TP2ModeText() + "\n";
    s += OBListText();
+   s += FiltersStatusText(ServerNow());
+   s += "High-impact news this week:\n" + UpcomingNewsText(ServerNow(), 96);
    s += E_Clock() + " Entries Wed / Thu / Fri | weekly close " + DayTime(g_closeEffective) + " (server)";
    return s;
   }
@@ -2171,6 +3075,7 @@ string BuildStatusText(void)
    string s = E_Bot() + " STATUS - " + _Symbol + "\n";
    s += "Server: " + DayTime(now) + "\n";
    s += "EA: " + g_status + "\n";
+   s += FiltersStatusText(now);
    s += "Setups this week: " + IntegerToString(SetupsThisWeek()) + "/" + IntegerToString(InpMaxSetupsPerWeek) + "\n";
    s += "Open trades: " + IntegerToString(n) + "\n" + OpenPositionsText();
    s += "Floating: " + SignedMoney(FloatingPL()) + " " + Currency() + "\n";
@@ -2191,6 +3096,7 @@ string BuildDailyReport(const datetime dayStart)
         + IntegerToString(w.closed) + " | Net " + SignedMoney(w.net) + " " + Currency() + "\n";
    s += "Open trades:\n" + OpenPositionsText();
    s += "Balance: " + M2S(AccountInfoDouble(ACCOUNT_BALANCE)) + " | Equity: " + M2S(AccountInfoDouble(ACCOUNT_EQUITY)) + "\n";
+   s += "Next 24h high-impact news:\n" + UpcomingNewsText(ServerNow(), 24);
    s += "Status: " + g_status;
    return s;
   }
@@ -2268,6 +3174,8 @@ void PeriodicChecks(const datetime now)
   {
    EnsureWeek(now);
    CheckWeeklyClose(now);
+   RefreshNews(now);
+   NewsAlertCheck(now);
    WeeklyReportCheck(now);
    DailyReportCheck(now);
   }
@@ -2304,6 +3212,20 @@ bool ValidateInputs(void)
                            else
                               if(InpATRPeriod < 2)
                                  e = "ATR period must be >= 2";
+   if(e == "" && InpTP2Mode != TP2_FIXED_RR && (InpTrailATRPeriod < 2 || InpTrailATRMult <= 0 || InpTrailStep < 0))
+      e = "Trailing stop settings are invalid";
+   if(e == "" && InpTrendMode != TREND_OFF && (InpTrendMAPeriod < 2 || InpTrendLookback < 20 || InpTrendSwingBars < 1))
+      e = "Trend filter settings are invalid";
+   if(e == "" && InpEntryConfirm != CONFIRM_REJECTION && (InpChochSwingBars < 1 || InpChochWindow < 1 || InpChochSwingLookback < 3))
+      e = "ChoCH settings are invalid";
+   if(e == "" && InpUseNewsFilter && (InpNewsMinsBefore < 0 || InpNewsMinsAfter < 0))
+      e = "News minutes must be >= 0";
+   if(e == "" && (InpLondonStartHour < 0 || InpLondonStartHour > 24 || InpLondonEndHour < 0 || InpLondonEndHour > 24 ||
+                  InpNYStartHour < 0 || InpNYStartHour > 24 || InpNYEndHour < 0 || InpNYEndHour > 24 ||
+                  InpAsiaStartHour < 0 || InpAsiaStartHour > 24 || InpAsiaEndHour < 0 || InpAsiaEndHour > 24))
+      e = "Session hours must be between 0 and 24";
+   if(e == "" && InpUseSessionFilter && !InpSessLondon && !InpSessNewYork && !InpSessAsia)
+      e = "Session filter is on but no session is selected";
    if(e != "")
      {
       Alert(g_eaName, ": ", e);
@@ -2345,6 +3267,27 @@ int OnInit()
       Print(g_eaName, ": failed to create ATR handles, error ", GetLastError());
       return INIT_FAILED;
      }
+   if(InpTP2Mode != TP2_FIXED_RR)
+     {
+      g_hAtrTrail = iATR(_Symbol, InpTrailTF, InpTrailATRPeriod);
+      if(g_hAtrTrail == INVALID_HANDLE)
+        {
+         Print(g_eaName, ": failed to create the trailing ATR handle, error ", GetLastError());
+         return INIT_FAILED;
+        }
+     }
+   if(InpTrendMode == TREND_MA || InpTrendMode == TREND_MA_AND_STRUCTURE)
+     {
+      g_hTrendMA = iMA(_Symbol, InpTrendTF, InpTrendMAPeriod, 0, InpTrendMAMethod, PRICE_CLOSE);
+      if(g_hTrendMA == INVALID_HANDLE)
+        {
+         Print(g_eaName, ": failed to create the trend MA handle, error ", GetLastError());
+         return INIT_FAILED;
+        }
+     }
+   ArrayResize(g_trailTickets, 0);
+   ArrayResize(g_news, 0);
+   g_newsLoaded = 0;
 
    g_tgToken = InpTelegramToken;
    g_tgChat  = InpTelegramChatId;
@@ -2377,7 +3320,10 @@ int OnInit()
          string acc  = g_netting ? "netting" : "hedging";
          TgSend(E_Bot() + " " + g_eaName + " v" + g_eaVer + " started\n"
                 + "Symbol: " + _Symbol + " | Account " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + " (" + acc + ")\n"
-                + "Risk: " + risk + " | TP1 Tuesday 50% + TP2 1:" + DoubleToString(InpRewardRisk, 1) + "\n"
+                + "Risk: " + risk + " | TP1 Tuesday 50% + TP2 " + TP2ModeText() + "\n"
+                + "Entry: " + ConfirmModeText() + " | Trend filter: " + TrendText(TrendDir()) + "\n"
+                + "Sessions: " + SessionSetupText() + " | News filter: " + (InpUseNewsFilter ? IntegerToString(InpNewsMinsBefore)
+                      + "/" + IntegerToString(InpNewsMinsAfter) + " min" : "off") + "\n"
                 + "Entries: Wed / Thu / Fri | Weekly close " + DayTime(g_closeEffective) + " (server)\n"
                 + "Send /help for commands.");
         }
@@ -2400,6 +3346,10 @@ void OnDeinit(const int reason)
       IndicatorRelease(g_hAtrH4);
    if(g_hAtrM5 != INVALID_HANDLE)
       IndicatorRelease(g_hAtrM5);
+   if(g_hAtrTrail != INVALID_HANDLE)
+      IndicatorRelease(g_hAtrTrail);
+   if(g_hTrendMA != INVALID_HANDLE)
+      IndicatorRelease(g_hTrendMA);
    ObjectsDeleteAll(0, g_pfx + "PANEL");
    if(reason == REASON_REMOVE && !g_isTester)
       ObjectsDeleteAll(0, g_pfx);
@@ -2414,6 +3364,7 @@ void OnTick()
    datetime now = TimeCurrent();
    PeriodicChecks(now);
    ManageVirtualPartial();
+   ManageTrailing();
 
    datetime m5 = iTime(_Symbol, PERIOD_M5, 0);
    bool newM5  = (m5 > 0 && m5 != g_lastM5Bar);
@@ -2434,7 +3385,7 @@ void OnTick()
    if(newM5)
      {
       g_lastM5Bar = m5;
-      ManageBreakeven();
+      ManageRunners();
       if(g_week.valid)
          CheckEntries();
       else
@@ -2498,7 +3449,13 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
               : E_Target() + " TP2 HIT - full target 1:" + DoubleToString(InpRewardRisk, 1);
    else
       if(reason == DEAL_REASON_SL)
-         title = (profit >= 0) ? E_Shield() + " Stopped at breakeven / in profit" : E_Stop() + " STOP LOSS HIT";
+        {
+         bool runner = (magic == g_magicR || g_netting);
+         if(profit > 0 && runner && InpTP2Mode != TP2_FIXED_RR)
+            title = E_Target() + " TRAILING STOP HIT - profit locked on the TP2 trade";
+         else
+            title = (profit >= 0) ? E_Shield() + " Stopped at breakeven / in profit" : E_Stop() + " STOP LOSS HIT";
+        }
       else
          if(reason == DEAL_REASON_SO)
             title = E_Warn() + " STOP OUT (margin)";
@@ -2513,7 +3470,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
             else
                title = E_Warn() + " Closed manually / externally";
 
-   string leg = tp1Leg ? "Trade 1 (TP1 partial)" : (magic == g_magicR ? "Trade 2 (TP2 full)" : "Position");
+   string runnerName = (InpTP2Mode == TP2_ATR_TRAIL) ? "Trade 2 (ATR trailing)" : "Trade 2 (TP2 full)";
+   string leg = tp1Leg ? "Trade 1 (TP1 partial)" : (magic == g_magicR ? runnerName : "Position");
    string msg = title + "\n"
                 + _Symbol + " " + leg + " | " + L2S(vol) + " lot @ " + P2S(price) + "\n"
                 + "Result: " + SignedMoney(profit) + " " + Currency() + "\n"
@@ -2521,7 +3479,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    Print(_Symbol, " ", leg, " closed @ ", P2S(price), " result ", SignedMoney(profit));
    TgSend(msg);
 
-   ManageBreakeven();
+   ManageRunners();
    UpdatePanel();
   }
 //+------------------------------------------------------------------+
