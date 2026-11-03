@@ -32,3 +32,10 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+# Bot secrets / runtime
+.env
+bot/.env
+bot/bot.log
+__pycache__/
+.pytest_cache/
