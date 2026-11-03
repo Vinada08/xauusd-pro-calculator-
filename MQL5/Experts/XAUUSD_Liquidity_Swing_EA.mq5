@@ -35,10 +35,17 @@
 //| 10. ATR trailing stop for the TP2 trade once TP1 is hit          |
 //|     (replaces the fixed 1:2 target, or runs on top of it).       |
 //| 11. M5 ChoCH / structure-break confirmation after the OB touch.  |
+//|                                                                  |
+//|  v2.10                                                           |
+//| 12. Up to 5 setups per week (each = TP1 trade + TP2 trade).      |
+//| 13. Weekly profit target ($250): when reached, open trades are   |
+//|     closed and no new trades are taken until next week.          |
+//| 14. Entries at the H4 order blocks AND directly at the D1 sell / |
+//|     buy zones (same M5 rejection + ChoCH confirmation).          |
 //+------------------------------------------------------------------+
 #property copyright   "xauusd-pro-calculator"
 #property link        "https://github.com/vinada08/xauusd-pro-calculator-"
-#property version     "2.00"
+#property version     "2.10"
 #property description "XAUUSD swing EA: D1 Fri/Mon/Tue liquidity zones -> H4 order block -> M5 rejection + ChoCH entry."
 #property description "Every setup = 2 trades: TP1 at the Tuesday D1 50% (yellow) + TP2 trade with ATR trailing stop (or 1:2)."
 #property description "Filters: high-impact news, London/New York sessions, HTF trend. Wed/Thu/Fri only, weekly close Sat 04:30."
@@ -85,6 +92,13 @@ enum ENUM_TREND_MODE
    TREND_MA               = 1, // Moving average (price vs MA + slope)
    TREND_STRUCTURE        = 2, // Market structure (HH/HL vs LH/LL)
    TREND_MA_AND_STRUCTURE = 3  // MA and structure must agree
+  };
+
+enum ENUM_POI_MODE
+  {
+   POI_OB_ONLY     = 0,     // H4 order blocks only
+   POI_ZONE_ONLY   = 1,     // D1 sell / buy zones only
+   POI_OB_AND_ZONE = 2      // H4 order blocks + D1 zones
   };
 
 enum ENUM_ENTRY_CONFIRM
@@ -159,6 +173,9 @@ input double          InpZoneDepthPct         = 25.0;            // Zone depth: 
 input double          InpZoneMinDepthATR      = 0.25;            // Minimum zone depth (x D1 ATR)
 input double          InpZoneSweepATR         = 0.35;            // Zone extends beyond the extreme for sweeps (x D1 ATR)
 input bool            InpRequireSweep         = false;           // Require the Fri/Mon/Tue high/low to be swept first
+input ENUM_POI_MODE   InpEntryPOI             = POI_OB_AND_ZONE; // Where to take entries
+input ENUM_SL_MODE    InpZoneSLMode           = SL_M5_CANDLE;    // D1 zone entries: SL beyond the M5 tap (or the zone edge)
+input int             InpMaxZoneTradesPerSide = 2;               // D1 zone entries: max per zone side per week (0 = no limit)
 input int             InpATRPeriod            = 14;              // ATR period (D1 / H4 / M5)
 
 input group "=== H4 order blocks ==="
@@ -203,7 +220,12 @@ input bool            InpMoveRunnerToBE       = true;            // Move the TP2
 input double          InpBEOffset             = 0.30;            // Breakeven offset in profit (price, $)
 input double          InpMaxSpread            = 0.80;            // Maximum spread allowed for entries (price, $)
 input int             InpSlippagePoints       = 30;              // Maximum slippage (points)
-input int             InpMaxSetupsPerWeek     = 1;               // Setups per week (each setup = 2 trades)
+input int             InpMaxSetupsPerWeek     = 5;               // Max setups per week (each setup = TP1 trade + TP2 trade)
+
+input group "=== Weekly profit target ==="
+input double          InpWeeklyProfitTarget   = 250.0;           // Weekly profit target in account currency (0 = off)
+input bool            InpTargetIncludeFloating= true;            // Count open trades' floating P/L toward the target
+input bool            InpTargetCloseTrades    = true;            // Close open trades when the target is reached
 
 input group "=== Chart drawing ==="
 input bool            InpDraw                 = true;            // Draw zones / Tuesday / order blocks
@@ -258,6 +280,8 @@ struct SWeekLiquidity
    double            buyTop;
    double            buyBottom;
    double            tueMid;         // Tuesday 50% = TP1 (partial)
+   bool              sellZoneOk;     // false once an M5 candle closed above the sell zone
+   bool              buyZoneOk;      // false once an M5 candle closed below the buy zone
    double            atrD1;
   };
 
@@ -293,7 +317,7 @@ struct SNewsEvent
 //+------------------------------------------------------------------+
 const string   g_pfx     = "LSW_";
 const string   g_eaName  = "XAU Liquidity Swing EA";
-const string   g_eaVer   = "2.00";
+const string   g_eaVer   = "2.10";
 
 CTrade         g_tradeP;                 // TP1 / partial trade (magic)
 CTrade         g_tradeR;                 // TP2 / full trade (magic + 1)
@@ -328,6 +352,11 @@ bool           g_netting           = false;
 bool           g_tgUrlWarned       = false;
 bool           g_closeFailNotified = false;
 int            g_setupsMem         = 0;
+int            g_zoneSellMem       = 0;
+int            g_zoneBuyMem        = 0;
+double         g_weekRealized      = 0.0;
+bool           g_targetHit         = false;
+datetime       g_lastTargetClose   = 0;
 long           g_tgOffset          = 0;
 string         g_tgToken           = "";
 string         g_tgChat            = "";
@@ -705,9 +734,14 @@ void EnsureWeek(const datetime now)
    ZeroMemory(g_week);
    ArrayResize(g_obs, 0);
    g_setupsMem         = 0;
+   g_zoneSellMem       = 0;
+   g_zoneBuyMem        = 0;
    g_lastH4Bar         = 0;
    g_closeFailNotified = false;
    ComputeCloseTimes(ws);
+   string gv = GVName("target");
+   g_targetHit = GlobalVariableCheck(gv) && (long)GlobalVariableGet(gv) >= (long)ws;
+   UpdateWeekRealized();
    g_status = "New week " + TimeToString(ws, TIME_DATE) + ": Fri/Mon/Tue liquidity forming";
   }
 
@@ -1176,6 +1210,97 @@ int SetupsThisWeek(void)
    return (s.setups > g_setupsMem) ? s.setups : g_setupsMem;
   }
 
+//--- D1 zone entries this week on one side (entry deals of the TP1 trade tagged " Z ")
+int ZoneTradesThisWeek(const int dir)
+  {
+   int cnt = 0;
+   if(HistorySelect(g_curWeekStart, (datetime)((long)TimeCurrent() + 86400)))
+     {
+      int total = HistoryDealsTotal();
+      for(int i = 0; i < total; i++)
+        {
+         ulong d = HistoryDealGetTicket(i);
+         if(d == 0)
+            continue;
+         if(HistoryDealGetString(d, DEAL_SYMBOL) != _Symbol || HistoryDealGetInteger(d, DEAL_MAGIC) != g_magicP)
+            continue;
+         if(HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_IN)
+            continue;
+         if(StringFind(HistoryDealGetString(d, DEAL_COMMENT), " Z ") < 0)
+            continue;
+         long type = HistoryDealGetInteger(d, DEAL_TYPE);
+         if((dir < 0 && type == DEAL_TYPE_SELL) || (dir > 0 && type == DEAL_TYPE_BUY))
+            cnt++;
+        }
+     }
+   int mem = (dir < 0) ? g_zoneSellMem : g_zoneBuyMem;
+   return (cnt > mem) ? cnt : mem;
+  }
+
+bool ZoneTradeRoom(const int dir)
+  {
+   if(InpMaxZoneTradesPerSide <= 0)
+      return true;
+   return (ZoneTradesThisWeek(dir) < InpMaxZoneTradesPerSide);
+  }
+
+//+------------------------------------------------------------------+
+//| Weekly profit target                                             |
+//+------------------------------------------------------------------+
+void UpdateWeekRealized(void)
+  {
+   SStats s;
+   CalcStats(g_curWeekStart, (datetime)((long)TimeCurrent() + 86400), s);
+   g_weekRealized = s.net;
+  }
+
+double WeekProgress(void)
+  {
+   return g_weekRealized + (InpTargetIncludeFloating ? FloatingPL() : 0.0);
+  }
+
+string TargetText(void)
+  {
+   if(InpWeeklyProfitTarget <= 0)
+      return "off";
+   string s = SignedMoney(WeekProgress()) + " / " + M2S(InpWeeklyProfitTarget) + " " + Currency();
+   if(g_targetHit)
+      s += " - REACHED";
+   return s;
+  }
+
+void CheckWeeklyTarget(void)
+  {
+   if(InpWeeklyProfitTarget <= 0 || g_curWeekStart == 0)
+      return;
+   if(!g_targetHit)
+     {
+      double progress = WeekProgress();
+      if(progress < InpWeeklyProfitTarget)
+         return;
+      g_targetHit = true;
+      GlobalVariableSet(GVName("target"), (double)g_curWeekStart);
+      int nP0 = 0, nR0 = 0;
+      int open = CountOurPositions(nP0, nR0);
+      string act = (open > 0 && InpTargetCloseTrades) ? "Closing the open trade(s) to lock the profit.\n" : "";
+      TgSend(E_Target() + " WEEKLY PROFIT TARGET REACHED - " + _Symbol + "\n"
+             + "Week result: " + SignedMoney(progress) + " " + Currency() + " (target " + M2S(InpWeeklyProfitTarget) + ")\n"
+             + act + "No new trades until next week.");
+      g_status = "Weekly profit target reached - no new trades this week";
+     }
+   if(!InpTargetCloseTrades)
+      return;
+   int nP = 0, nR = 0;
+   if(CountOurPositions(nP, nR) == 0)
+      return;
+   datetime now = TimeCurrent();
+   long since = (long)now - (long)g_lastTargetClose;
+   if(g_lastTargetClose > 0 && since >= 0 && since < 15)
+      return;
+   g_lastTargetClose = now;
+   CloseAllOurPositions("WEEKLY PROFIT TARGET REACHED");
+  }
+
 //+------------------------------------------------------------------+
 //| D1 liquidity: Friday (prev week) + Monday + Tuesday              |
 //+------------------------------------------------------------------+
@@ -1299,6 +1424,8 @@ bool BuildWeeklyLiquidity(const datetime ws)
    w.buyTop     = MathMin(w.liqLow + buyDepth, mid);
    w.tueMid     = w.hasTue ? (w.tueHigh + w.tueLow) / 2.0 : 0.0;
    w.valid      = true;
+   w.sellZoneOk = true;
+   w.buyZoneOk  = true;
    g_week = w;
    return true;
   }
@@ -1614,6 +1741,11 @@ bool CanOpenNewSetup(string &why)
       why = "News pause: " + g_news[ni].name + " at " + TimeToString(g_news[ni].time, TIME_MINUTES);
       return false;
      }
+   if(InpWeeklyProfitTarget > 0 && g_targetHit)
+     {
+      why = "Weekly profit target reached (" + TargetText() + ") - no new trades this week";
+      return false;
+     }
    int setups = SetupsThisWeek();
    if(setups >= InpMaxSetupsPerWeek)
      {
@@ -1715,15 +1847,16 @@ bool CheckChoch(const SOrderBlock &ob, const MqlRates &m5[], const int count, co
    return true;
   }
 
-//--- entry signal for one order block: fills the SL anchor (candle / structure extreme) and the arrow position
-bool FindEntrySignal(const int idx, const MqlRates &m5[], const int count, const double atr,
+//--- entry signal at one point of interest (H4 order block or D1 zone):
+//--- fills the SL anchor (candle / structure extreme) and the arrow position
+bool FindEntrySignal(const SOrderBlock &poi, const MqlRates &m5[], const int count, const double atr,
                      string &pattern, double &ext, datetime &sigTime, double &sigPrice)
   {
-   bool isSell = (g_obs[idx].dir < 0);
+   bool isSell = (poi.dir < 0);
    if(InpEntryConfirm == CONFIRM_REJECTION)
      {
       int sig = InpRequireConfirm ? 2 : 1;
-      if(!IsRejection(g_obs[idx], m5, sig, atr, pattern))
+      if(!IsRejection(poi, m5, sig, atr, pattern))
          return false;
       ext = isSell ? m5[sig].high : m5[sig].low;
       if(InpRequireConfirm)
@@ -1740,7 +1873,7 @@ bool FindEntrySignal(const int idx, const MqlRates &m5[], const int count, const
       return true;
      }
    double sweep = 0.0, level = 0.0;
-   if(!CheckChoch(g_obs[idx], m5, count, atr, pattern, sweep, level))
+   if(!CheckChoch(poi, m5, count, atr, pattern, sweep, level))
       return false;
    ext      = sweep;
    sigTime  = m5[1].time;
@@ -1772,6 +1905,22 @@ void CheckEntries(void)
         }
      }
 
+   //--- an M5 close beyond a D1 zone (incl. its sweep allowance) = zone broken for the rest of the week
+   if(g_week.valid && g_week.sellZoneOk && m5[1].close > g_week.sellTop)
+     {
+      g_week.sellZoneOk = false;
+      DrawWeek();
+      if(InpEntryPOI != POI_OB_ONLY)
+         TgSend(E_Warn() + " " + _Symbol + " D1 SELL zone broken (M5 close above " + P2S(g_week.sellTop) + ") - no more sell-zone entries this week");
+     }
+   if(g_week.valid && g_week.buyZoneOk && m5[1].close < g_week.buyBottom)
+     {
+      g_week.buyZoneOk = false;
+      DrawWeek();
+      if(InpEntryPOI != POI_OB_ONLY)
+         TgSend(E_Warn() + " " + _Symbol + " D1 BUY zone broken (M5 close below " + P2S(g_week.buyBottom) + ") - no more buy-zone entries this week");
+     }
+
    string why = "";
    if(!CanOpenNewSetup(why))
      {
@@ -1784,51 +1933,99 @@ void CheckEntries(void)
       atrM5 = m5[1].high - m5[1].low;
    g_trendDir = TrendDir();
 
-   int active = 0, againstTrend = 0;
-   for(int i = 0; i < ArraySize(g_obs); i++)
-      if(g_obs[i].valid && !g_obs[i].used)
+   //--- points of interest: H4 order blocks first, then the D1 zones themselves
+   SOrderBlock poi[];
+   int src[];                                // >= 0: index in g_obs, -1: D1 zone
+   if(InpEntryPOI != POI_ZONE_ONLY)
+      for(int i = 0; i < ArraySize(g_obs); i++)
+         if(g_obs[i].valid && !g_obs[i].used)
+            PushPOI(poi, src, g_obs[i], i);
+   if(InpEntryPOI != POI_OB_ONLY)
+     {
+      SOrderBlock z;
+      if(g_week.sellZoneOk && ZoneTradeRoom(-1))
         {
-         active++;
-         if(!TrendAllows(g_obs[i].dir, g_trendDir))
-            againstTrend++;
+         MakeZonePOI(-1, z);
+         PushPOI(poi, src, z, -1);
         }
+      if(g_week.buyZoneOk && ZoneTradeRoom(+1))
+        {
+         MakeZonePOI(+1, z);
+         PushPOI(poi, src, z, -1);
+        }
+     }
+
+   int active = ArraySize(poi), againstTrend = 0;
+   for(int i = 0; i < active; i++)
+      if(!TrendAllows(poi[i].dir, g_trendDir))
+         againstTrend++;
    if(active == 0)
      {
-      g_status = "Watching: no active H4 order block inside the D1 zones";
+      g_status = "Watching: no active H4 order block / D1 zone";
       return;
      }
    if(againstTrend == active)
      {
-      g_status = "HTF trend " + TrendText(g_trendDir) + ": active OB(s) are against the trend";
+      g_status = "HTF trend " + TrendText(g_trendDir) + ": active OB / zone(s) are against the trend";
       return;
      }
    string confirmTxt = (InpEntryConfirm == CONFIRM_REJECTION) ? "rejection candle"
                        : (InpEntryConfirm == CONFIRM_CHOCH ? "ChoCH" : "rejection + ChoCH");
-   g_status = "Watching " + IntegerToString(active - againstTrend) + " H4 OB(s) for an M5 " + confirmTxt;
+   g_status = "Watching " + IntegerToString(active - againstTrend) + " H4 OB / D1 zone(s) for an M5 " + confirmTxt;
 
-   for(int i = 0; i < ArraySize(g_obs); i++)
+   for(int i = 0; i < active; i++)
      {
-      if(!g_obs[i].valid || g_obs[i].used)
-         continue;
-      if(!TrendAllows(g_obs[i].dir, g_trendDir))
+      if(!TrendAllows(poi[i].dir, g_trendDir))
          continue;
       string pattern = "";
       double ext = 0.0, sigPrice = 0.0;
       datetime sigTime = 0;
-      if(!FindEntrySignal(i, m5, count, atrM5, pattern, ext, sigTime, sigPrice))
+      if(!FindEntrySignal(poi[i], m5, count, atrM5, pattern, ext, sigTime, sigPrice))
          continue;
-      if(InpRequireSweep && !LiquiditySwept(g_obs[i].dir))
+      if(InpRequireSweep && !LiquiditySwept(poi[i].dir))
         {
          g_status = "Signal seen but the Fri/Mon/Tue liquidity is not swept yet";
          continue;
         }
-      if(OpenSetup(i, ext, sigTime, sigPrice, pattern))
+      bool isZone = (src[i] < 0);
+      int res = OpenSetup(poi[i], isZone, ext, sigTime, sigPrice, pattern);
+      if(res != 0 && !isZone)
         {
-         g_obs[i].used = true;
-         DrawOB(g_obs[i]);
+         g_obs[src[i]].used = true;           // traded, or skipped for good (lot / risk limits)
+         DrawOB(g_obs[src[i]]);
+        }
+      if(res > 0)
+        {
+         if(isZone)
+           {
+            if(poi[i].dir < 0)
+               g_zoneSellMem++;
+            else
+               g_zoneBuyMem++;
+           }
          break;
         }
      }
+  }
+
+void PushPOI(SOrderBlock &arr[], int &src[], const SOrderBlock &p, const int from)
+  {
+   int n = ArraySize(arr);
+   ArrayResize(arr, n + 1);
+   ArrayResize(src, n + 1);
+   arr[n] = p;
+   src[n] = from;
+  }
+
+//--- the D1 sell / buy zone as a point of interest
+void MakeZonePOI(const int dir, SOrderBlock &z)
+  {
+   z.time  = g_week.weekStart;
+   z.dir   = dir;
+   z.high  = (dir < 0) ? g_week.sellTop : g_week.buyTop;
+   z.low   = (dir < 0) ? g_week.sellBottom : g_week.buyBottom;
+   z.valid = true;
+   z.used  = false;
   }
 
 //+------------------------------------------------------------------+
@@ -1933,6 +2130,15 @@ string TP2ModeText(void)
    return "1:" + DoubleToString(InpRewardRisk, 1) + " + ATR trail (" + TrailText() + ")";
   }
 
+string POIText(void)
+  {
+   if(InpEntryPOI == POI_OB_ONLY)
+      return "H4 order blocks";
+   if(InpEntryPOI == POI_ZONE_ONLY)
+      return "D1 zones";
+   return "H4 order blocks + D1 zones";
+  }
+
 string ConfirmModeText(void)
   {
    if(InpEntryConfirm == CONFIRM_REJECTION)
@@ -1968,19 +2174,22 @@ string FiltersStatusText(const datetime now)
           + "HTF trend: " + TrendText(TrendDir()) + "\n";
   }
 
-bool OpenSetup(const int idx, const double candleExt, const datetime sigTime, const double sigPrice, const string pattern)
+//--- returns 1 = opened, 0 = not opened (retry on a later signal), -1 = skipped for good (lot / risk limits)
+int OpenSetup(const SOrderBlock &poi, const bool isZone, const double candleExt, const datetime sigTime,
+              const double sigPrice, const string pattern)
   {
-   bool isSell = (g_obs[idx].dir < 0);
+   bool isSell = (poi.dir < 0);
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick))
-      return false;
+      return 0;
    double spread = tick.ask - tick.bid;
    double entry  = isSell ? tick.bid : tick.ask;
 
-   //--- stop loss: beyond the H4 OB (or the M5 rejection candle / ChoCH swing) + buffer
+   //--- stop loss: beyond the H4 OB / D1 zone edge (or the M5 rejection candle / ChoCH tap) + buffer
+   ENUM_SL_MODE slMode = isZone ? InpZoneSLMode : InpSLMode;
    double ext = candleExt;
-   if(InpSLMode == SL_OB_EXTREME)
-      ext = isSell ? MathMax(g_obs[idx].high, candleExt) : MathMin(g_obs[idx].low, candleExt);
+   if(slMode == SL_OB_EXTREME)
+      ext = isSell ? MathMax(poi.high, candleExt) : MathMin(poi.low, candleExt);
    double sl      = isSell ? ext + InpSLBuffer + spread : ext - InpSLBuffer;
    double minDist = StopsDistance() + spread;
    double minSL   = MathMax(InpMinSL, minDist);
@@ -1994,7 +2203,7 @@ bool OpenSetup(const int idx, const double candleExt, const datetime sigTime, co
      {
       g_status = DirText(isSell) + " signal skipped: SL " + P2S(risk) + " > max " + P2S(InpMaxSL);
       Print(g_status);
-      return false;
+      return 0;
      }
 
    //--- targets: TP1 = Tuesday 50% (partial), TP2 = 1:RR and / or ATR trailing stop
@@ -2044,19 +2253,18 @@ bool OpenSetup(const int idx, const double candleExt, const datetime sigTime, co
       g_status = DirText(isSell) + " signal skipped: " + err;
       Print(g_status);
       TgSend(E_Warn() + " " + _Symbol + " " + DirText(isSell) + " signal skipped: " + err);
-      g_obs[idx].used = true;                // do not retry the same order block every bar
-      DrawOB(g_obs[idx]);
-      return false;
+      return -1;                             // caller stops retrying this order block
      }
 
    //--- send the 2 trades (hedging) or 1 trade + EA-managed partial (netting)
    ulong tP = 0, tR = 0;
    bool okP = false, okR = false;
    string warn = "";
+   string tag  = isZone ? " Z" : "";          // " Z " in the comment marks a D1 zone entry
    if(g_netting)
      {
       double total = FloorLot(lotP + lotR);
-      okP = SendMarket(g_tradeP, isSell, total, sl, tp2, InpComment + " TP2", tP);
+      okP = SendMarket(g_tradeP, isSell, total, sl, tp2, InpComment + tag + " TP2", tP);
       if(okP)
         {
          GlobalVariableSet(GVName("vtp1"), tp1);
@@ -2066,8 +2274,8 @@ bool OpenSetup(const int idx, const double candleExt, const datetime sigTime, co
      }
    else
      {
-      okP = SendMarket(g_tradeP, isSell, lotP, sl, tp1, InpComment + " TP1", tP);
-      okR = SendMarket(g_tradeR, isSell, lotR, sl, tp2, InpComment + " TP2", tR);
+      okP = SendMarket(g_tradeP, isSell, lotP, sl, tp1, InpComment + tag + " TP1", tP);
+      okR = SendMarket(g_tradeR, isSell, lotR, sl, tp2, InpComment + tag + " TP2", tR);
       if(okP != okR)
         {
          string which = okP ? "TP1 partial" : "TP2 full";
@@ -2078,7 +2286,7 @@ bool OpenSetup(const int idx, const double candleExt, const datetime sigTime, co
      {
       g_status = "Order failed: " + g_tradeP.ResultRetcodeDescription();
       TgSend(E_X() + " " + _Symbol + " " + DirText(isSell) + " entry FAILED: " + g_tradeP.ResultRetcodeDescription());
-      return false;
+      return 0;
      }
    g_setupsMem++;
 
@@ -2102,9 +2310,12 @@ bool OpenSetup(const int idx, const double candleExt, const datetime sigTime, co
 
    string sess = "";
    SessionAllows(TimeCurrent(), sess);
+   string poiTxt = isZone ? "Entry at the D1 " + DirText(isSell) + " zone " + P2S(poi.low) + " - " + P2S(poi.high) + " (direct zone entry)"
+                   : "Entry at the H4 OB " + P2S(poi.low) + " - " + P2S(poi.high) + " in the D1 " + DirText(isSell) + " zone";
    string msg = (isSell ? E_Down() : E_Up()) + " " + DirText(isSell) + " SETUP OPENED - " + _Symbol + "\n"
                 + "Signal: M5 " + pattern + "\n"
-                + "H4 OB: " + P2S(g_obs[idx].low) + " - " + P2S(g_obs[idx].high) + " in the D1 " + DirText(isSell) + " zone\n"
+                + poiTxt + "\n"
+                + "Setup " + IntegerToString(SetupsThisWeek()) + "/" + IntegerToString(InpMaxSetupsPerWeek) + " this week | week P/L " + TargetText() + "\n"
                 + "Filters: trend " + TrendText(g_trendDir) + " | session " + sess + " | news clear\n"
                 + "Entry: " + P2S(fill) + "\n"
                 + E_Stop() + " SL: " + P2S(sl) + " (" + P2S(risk) + " away)\n"
@@ -2116,7 +2327,7 @@ bool OpenSetup(const int idx, const double candleExt, const datetime sigTime, co
    TgSend(msg);
    TgSendScreenshot(_Symbol + " " + DirText(isSell) + " entry @ " + P2S(fill) + " | SL " + P2S(sl) + " | TP1 " + P2S(tp1) + " | TP2 " + tp2Price);
    g_status = DirText(isSell) + " setup running - holding until TP / SL or weekly close";
-   return true;
+   return 1;
   }
 
 //+------------------------------------------------------------------+
@@ -2533,11 +2744,15 @@ void DrawWeek(void)
    datetime tStart = g_week.hasFri ? g_week.friTime : (g_week.hasMon ? g_week.monTime : g_week.tueTime);
 
    //--- sell / buy zones
-   DrawRect(p + "SELLZONE", tStart, g_week.sellTop, tEnd, g_week.sellBottom, InpSellZoneColor, true, 1, STYLE_SOLID, true);
-   DrawRect(p + "BUYZONE", tStart, g_week.buyTop, tEnd, g_week.buyBottom, InpBuyZoneColor, true, 1, STYLE_SOLID, true);
-   DrawLabel(p + "SELLZONE_T", tWed, g_week.sellTop, "SELL ZONE (D1 liquidity high)  " + P2S(g_week.sellBottom) + " - " + P2S(g_week.sellTop),
+   color sellFill = g_week.sellZoneOk ? InpSellZoneColor : C'45,45,52';
+   color buyFill  = g_week.buyZoneOk ? InpBuyZoneColor : C'45,45,52';
+   string sellSt  = g_week.sellZoneOk ? "" : " - BROKEN";
+   string buySt   = g_week.buyZoneOk ? "" : " - BROKEN";
+   DrawRect(p + "SELLZONE", tStart, g_week.sellTop, tEnd, g_week.sellBottom, sellFill, true, 1, STYLE_SOLID, true);
+   DrawRect(p + "BUYZONE", tStart, g_week.buyTop, tEnd, g_week.buyBottom, buyFill, true, 1, STYLE_SOLID, true);
+   DrawLabel(p + "SELLZONE_T", tWed, g_week.sellTop, "SELL ZONE (D1 liquidity high)  " + P2S(g_week.sellBottom) + " - " + P2S(g_week.sellTop) + sellSt,
              InpLiqHighColor, ANCHOR_LEFT_LOWER);
-   DrawLabel(p + "BUYZONE_T", tWed, g_week.buyBottom, "BUY ZONE (D1 liquidity low)  " + P2S(g_week.buyBottom) + " - " + P2S(g_week.buyTop),
+   DrawLabel(p + "BUYZONE_T", tWed, g_week.buyBottom, "BUY ZONE (D1 liquidity low)  " + P2S(g_week.buyBottom) + " - " + P2S(g_week.buyTop) + buySt,
              InpLiqLowColor, ANCHOR_LEFT_UPPER);
 
    //--- Friday / Monday / Tuesday highs and lows
@@ -2667,7 +2882,7 @@ void UpdatePanel(void)
       PushLine(L, "D1 zones: waiting for the Tuesday close");
    PushLine(L, "Setups " + IntegerToString(setups) + "/" + IntegerToString(InpMaxSetupsPerWeek)
             + "   open trades " + IntegerToString(open) + "   float " + SignedMoney(FloatingPL()));
-   PushLine(L, "Week net " + SignedMoney(w.net) + " " + Currency());
+   PushLine(L, "Week target: " + TargetText());
    PushLine(L, "Weekly close " + DayTime(g_closeEffective));
    string sess = "";
    string sState = SessionAllows(now, sess) ? "OPEN " : "CLOSED ";
@@ -3077,6 +3292,7 @@ string BuildStatusText(void)
    s += "EA: " + g_status + "\n";
    s += FiltersStatusText(now);
    s += "Setups this week: " + IntegerToString(SetupsThisWeek()) + "/" + IntegerToString(InpMaxSetupsPerWeek) + "\n";
+   s += "Weekly profit target: " + TargetText() + "\n";
    s += "Open trades: " + IntegerToString(n) + "\n" + OpenPositionsText();
    s += "Floating: " + SignedMoney(FloatingPL()) + " " + Currency() + "\n";
    s += "Balance: " + M2S(AccountInfoDouble(ACCOUNT_BALANCE)) + " | Equity: " + M2S(AccountInfoDouble(ACCOUNT_EQUITY)) + "\n";
@@ -3094,6 +3310,7 @@ string BuildDailyReport(const datetime dayStart)
         + " | Net " + SignedMoney(d.net) + " " + Currency() + "\n";
    s += "This week: setups " + IntegerToString(w.setups) + "/" + IntegerToString(InpMaxSetupsPerWeek) + " | closed "
         + IntegerToString(w.closed) + " | Net " + SignedMoney(w.net) + " " + Currency() + "\n";
+   s += "Weekly profit target: " + TargetText() + "\n";
    s += "Open trades:\n" + OpenPositionsText();
    s += "Balance: " + M2S(AccountInfoDouble(ACCOUNT_BALANCE)) + " | Equity: " + M2S(AccountInfoDouble(ACCOUNT_EQUITY)) + "\n";
    s += "Next 24h high-impact news:\n" + UpcomingNewsText(ServerNow(), 24);
@@ -3112,6 +3329,11 @@ string BuildWeeklyReport(const datetime ws)
    s += "Trades closed: " + IntegerToString(w.closed) + " | Wins " + IntegerToString(w.wins) + " | Losses " + IntegerToString(w.losses)
         + " | Win rate " + DoubleToString(wr, 1) + "%\n";
    s += "Net P/L: " + SignedMoney(w.net) + " " + Currency() + "\n";
+   if(InpWeeklyProfitTarget > 0)
+     {
+      string reached = (w.net >= InpWeeklyProfitTarget || g_targetHit) ? "REACHED" : "not reached";
+      s += "Weekly profit target " + M2S(InpWeeklyProfitTarget) + " " + Currency() + ": " + reached + "\n";
+     }
    s += "Balance: " + M2S(AccountInfoDouble(ACCOUNT_BALANCE)) + " | Equity: " + M2S(AccountInfoDouble(ACCOUNT_EQUITY)) + "\n";
    s += E_Ok() + " Week finished - no trades held over the weekend.";
    return s;
@@ -3195,8 +3417,8 @@ bool ValidateInputs(void)
             if(InpLotMode == LOT_FIXED && InpFixedLot <= 0)
                e = "Fixed lot must be > 0";
             else
-               if(InpMaxSetupsPerWeek < 1)
-                  e = "Setups per week must be >= 1";
+               if(InpMaxSetupsPerWeek < 1 || InpWeeklyProfitTarget < 0 || InpMaxZoneTradesPerSide < 0)
+                  e = "Setups per week must be >= 1, profit target and zone trades >= 0";
                else
                   if(InpCloseHour < 0 || InpCloseHour > 23 || InpCloseMinute < 0 || InpCloseMinute > 59)
                      e = "Weekly close time is invalid";
@@ -3324,7 +3546,8 @@ int OnInit()
                 + "Entry: " + ConfirmModeText() + " | Trend filter: " + TrendText(TrendDir()) + "\n"
                 + "Sessions: " + SessionSetupText() + " | News filter: " + (InpUseNewsFilter ? IntegerToString(InpNewsMinsBefore)
                       + "/" + IntegerToString(InpNewsMinsAfter) + " min" : "off") + "\n"
-                + "Entries: Wed / Thu / Fri | Weekly close " + DayTime(g_closeEffective) + " (server)\n"
+                + "Entries: Wed / Thu / Fri at " + POIText() + " | max " + IntegerToString(InpMaxSetupsPerWeek) + " setups / week\n"
+                + "Weekly profit target: " + TargetText() + " | Weekly close " + DayTime(g_closeEffective) + " (server)\n"
                 + "Send /help for commands.");
         }
      }
@@ -3365,6 +3588,7 @@ void OnTick()
    PeriodicChecks(now);
    ManageVirtualPartial();
    ManageTrailing();
+   CheckWeeklyTarget();
 
    datetime m5 = iTime(_Symbol, PERIOD_M5, 0);
    bool newM5  = (m5 > 0 && m5 != g_lastM5Bar);
@@ -3385,6 +3609,7 @@ void OnTick()
    if(newM5)
      {
       g_lastM5Bar = m5;
+      UpdateWeekRealized();
       ManageRunners();
       if(g_week.valid)
          CheckEntries();
@@ -3479,6 +3704,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    Print(_Symbol, " ", leg, " closed @ ", P2S(price), " result ", SignedMoney(profit));
    TgSend(msg);
 
+   UpdateWeekRealized();
+   CheckWeeklyTarget();
    ManageRunners();
    UpdatePanel();
   }

@@ -13,13 +13,19 @@ A swing-trading Expert Advisor for **XAUUSD (Gold)** that follows this rule set:
 |------|-----------|------------------|
 | 1 | **D1** | Reads the liquidity of **Friday** (previous week), **Monday** and **Tuesday**. The highest high of the 3 days becomes the **SELL zone**, the lowest low the **BUY zone**. |
 | 2 | **D1** | Maps the **Tuesday candle in YELLOW** and draws its **50% (centre) line** – this is the **partial take profit (TP1)**. |
-| 3 | **H4** | Finds **order blocks** inside the zones: bearish OB (last up candle before a bearish displacement) in the SELL zone, bullish OB (last down candle before a bullish displacement) in the BUY zone. |
+| 3 | **H4** | Finds **order blocks** inside the zones: bearish OB (last up candle before a bearish displacement) in the SELL zone, bullish OB (last down candle before a bullish displacement) in the BUY zone. Entries are taken at the **order blocks and directly at the D1 zones**. |
 | 4 | **M5** | Maps the H4 order block on the M5 chart and waits for a **rejection / wick candle** (pin bar or engulfing) **plus an M5 ChoCH** (structure break) after the OB tap. |
 | 5 | Filters | **High-impact news** pause, **London / New York session** only, **HTF trend** (D1/W1) must agree with the trade direction. |
-| 6 | Entry | Opens **exactly 2 trades** with the same stop loss: **Trade 1 → TP1 = Tuesday 50%** (partial), **Trade 2 → ATR trailing stop after TP1** (or the fixed 1:2 target). |
+| 6 | Entry | Every setup opens **2 trades** with the same stop loss: **Trade 1 → TP1 = Tuesday 50%** (partial), **Trade 2 → ATR trailing stop after TP1** (or the fixed 1:2 target). Up to **5 setups per week**, and trading stops for the week once the **$250 weekly profit target** is reached. |
 | 7 | Days | New entries **only on Wednesday, Thursday and Friday**. |
 | 8 | Exit | Trades are **never closed early** – they run until TP / SL / trailing stop, or until the **weekly close on Saturday 04:30**. |
 | 9 | Reports | **Telegram bot**: zones, order blocks, entries, news pauses, TP1 / trailing / SL, weekly close, daily + weekly reports, `/commands`. |
+
+## Version 2.10 – weekly limits and D1 zone entries
+
+* **Up to 5 setups per week** (`Max setups per week`, default 5). Each setup is still 2 trades (TP1 partial + TP2 / trailing), and only one setup is open at a time.
+* **Weekly profit target $250** (`Weekly profit target`, account currency, 0 = off). The week's result is the closed profit plus the floating P/L of the open trades (`Count open trades' floating P/L`). When it reaches the target the EA **closes the open trades** (`Close open trades when the target is reached`) and takes **no new trades until next Monday**. The state survives an EA / MT5 restart. Telegram: "WEEKLY PROFIT TARGET REACHED"; the panel, `/status`, daily and weekly reports show the progress (e.g. `+120.00 / 250.00 USD`).
+* **Entries at the H4 order block AND at the D1 zone** (`Where to take entries`: order blocks + D1 zones (default) / order blocks only / D1 zones only). A D1 zone entry needs the same M5 confirmation (rejection candle + ChoCH) and the same filters (trend, session, news), but no H4 order block. Its stop loss goes beyond the M5 tap high / low (`D1 zone entries: SL`), the TP1 / TP2 rules are unchanged, and at most 2 zone entries per side are taken per week (`max per zone side per week`). When an M5 candle closes beyond a zone (including its sweep allowance) the zone is marked **BROKEN** (grey) and no more zone entries are taken on that side that week. Order blocks are checked first, so a signal at an OB inside the zone is taken as an OB trade.
 
 ## Version 2.00 – new filters and trade management
 
@@ -147,7 +153,10 @@ So a trade opened on Wednesday is held through Thursday and Friday until TP / SL
 | Risk | SL placement | Beyond H4 OB | Or beyond the M5 rejection candle |
 | Risk | SL buffer / min / max | 0.50 / 3 / 40 ($) | Price distances in dollars |
 | Risk | Max spread | 0.80 ($) | No entry when the spread is wider |
-| Risk | Setups per week | 1 | Each setup = 2 trades (partial + full) |
+| Risk | Max setups per week | 5 | Each setup = 2 trades (partial + full) |
+| Weekly target | Profit target / count floating / close trades | 250 / true / true | Stop for the week at +250 (account currency) |
+| Entries | Where to take entries | OB + D1 zones | Or order blocks only / D1 zones only |
+| Entries | Zone SL / max zone entries per side | Beyond M5 tap / 2 | D1 zone entry settings |
 
 ## Backtesting
 
