@@ -42,10 +42,18 @@
 //|     closed and no new trades are taken until next week.          |
 //| 14. Entries at the H4 order blocks AND directly at the D1 sell / |
 //|     buy zones (same M5 rejection + ChoCH confirmation).          |
+//|                                                                  |
+//|  v2.11 STRATEGY TESTER FIXES                                     |
+//| 15. Max SL is automatic (1 x D1 ATR) instead of a fixed $40.     |
+//| 16. Signals are not lost when the tester skips M5 bars           |
+//|     ('Open prices only' / higher chart timeframe).               |
+//| 17. Diagnostics: every blocked signal is logged in the Journal   |
+//|     with its reason + a funnel report at the end of the test     |
+//|     (also /diag in Telegram).                                    |
 //+------------------------------------------------------------------+
 #property copyright   "xauusd-pro-calculator"
 #property link        "https://github.com/vinada08/xauusd-pro-calculator-"
-#property version     "2.10"
+#property version     "2.11"
 #property description "XAUUSD swing EA: D1 Fri/Mon/Tue liquidity zones -> H4 order block -> M5 rejection + ChoCH entry."
 #property description "Every setup = 2 trades: TP1 at the Tuesday D1 50% (yellow) + TP2 trade with ATR trailing stop (or 1:2)."
 #property description "Filters: high-impact news, London/New York sessions, HTF trend. Wed/Thu/Fri only, weekly close Sat 04:30."
@@ -115,6 +123,7 @@ input group "=== General ==="
 input long            InpMagic                = 260611;          // Magic number (TP1 trade = magic, TP2 trade = magic+1)
 input string          InpComment              = "XAU LiqSwing";  // Order comment
 input bool            InpOnlyGold             = true;            // Only run on gold symbols (XAU / GOLD)
+input bool            InpLogSignals           = true;            // Journal: log every signal and why it was not taken
 
 input group "=== Trading days & weekly close ==="
 input bool            InpTradeWednesday       = true;            // Allow new entries on Wednesday
@@ -215,7 +224,8 @@ input double          InpFallbackPartialRR    = 1.0;             // TP1 at this 
 input ENUM_SL_MODE    InpSLMode               = SL_OB_EXTREME;   // Stop loss placement
 input double          InpSLBuffer             = 0.50;            // SL buffer beyond the OB / candle extreme (price, $)
 input double          InpMinSL                = 3.00;            // Minimum SL distance (price, $)
-input double          InpMaxSL                = 40.00;           // Maximum SL distance (price, $) - signal skipped above
+input double          InpMaxSL                = 0.0;             // Maximum SL distance (price, $) - 0 = automatic (x D1 ATR)
+input double          InpMaxSLATR             = 1.0;             // Automatic maximum SL = x D1 ATR (when max SL = 0)
 input bool            InpMoveRunnerToBE       = true;            // Move the TP2 trade to breakeven when TP1 is hit
 input double          InpBEOffset             = 0.30;            // Breakeven offset in profit (price, $)
 input double          InpMaxSpread            = 0.80;            // Maximum spread allowed for entries (price, $)
@@ -304,6 +314,28 @@ struct SStats
    double            net;
   };
 
+struct SDiag
+  {
+   int               weeks;          // weeks started
+   int               zonesBuilt;     // weeks with D1 zones built
+   int               obsFound;       // H4 order blocks mapped
+   int               barsWatched;    // M5 bars evaluated with active OB / zone
+   int               barsTouch;      // ... where price touched an OB / zone
+   int               signals;        // M5 entry signals found
+   int               blkTrend;       // signal blocked: HTF trend
+   int               blkTime;        // signal blocked: day / hour / Friday cut-off / weekly close
+   int               blkSession;     // signal blocked: session filter
+   int               blkNews;        // signal blocked: news filter
+   int               blkSpread;      // signal blocked: spread
+   int               blkSweep;       // signal blocked: liquidity not swept
+   int               skipMaxSL;      // signal skipped: SL above the maximum
+   int               skipLots;       // signal skipped: lot / risk / margin
+   int               failOrder;      // order rejected
+   int               opened;         // setups opened
+  };
+
+#define DIAG(f) { g_diag.f++; g_diagW.f++; }
+
 struct SNewsEvent
   {
    datetime          time;           // server time
@@ -317,7 +349,7 @@ struct SNewsEvent
 //+------------------------------------------------------------------+
 const string   g_pfx     = "LSW_";
 const string   g_eaName  = "XAU Liquidity Swing EA";
-const string   g_eaVer   = "2.10";
+const string   g_eaVer   = "2.11";
 
 CTrade         g_tradeP;                 // TP1 / partial trade (magic)
 CTrade         g_tradeR;                 // TP2 / full trade (magic + 1)
@@ -352,6 +384,10 @@ bool           g_netting           = false;
 bool           g_tgUrlWarned       = false;
 bool           g_closeFailNotified = false;
 int            g_setupsMem         = 0;
+SDiag          g_diag;                   // whole run
+SDiag          g_diagW;                  // current week
+datetime       g_lastEvalBar       = 0;
+string         g_lastBlock         = "";
 int            g_zoneSellMem       = 0;
 int            g_zoneBuyMem        = 0;
 double         g_weekRealized      = 0.0;
@@ -727,9 +763,15 @@ void ComputeCloseTimes(const datetime weekStart)
 
 void EnsureWeek(const datetime now)
   {
+   if((long)now < 946684800)                 // clock not set yet (before 2000) - wait for a real time
+      return;
    datetime ws = WeekStartOf(now);
    if(ws <= g_curWeekStart)
       return;
+   if(g_curWeekStart > 0)
+      PrintWeekDiag(g_curWeekStart);
+   ZeroMemory(g_diagW);
+   DIAG(weeks);
    g_curWeekStart      = ws;
    ZeroMemory(g_week);
    ArrayResize(g_obs, 0);
@@ -1603,6 +1645,8 @@ void ScanOrderBlocks(const bool notify)
          DrawOB(g_obs[o]);
         }
      }
+   g_diag.obsFound  += newCount;
+   g_diagW.obsFound += newCount;
    ArrayResize(g_obs, nf);
    for(int f3 = 0; f3 < nf; f3++)
      {
@@ -1688,24 +1732,51 @@ bool LiquiditySwept(const int dir)
    return (arr[ArrayMinimum(arr)] < g_week.liqLow);
   }
 
-bool CanOpenNewSetup(string &why)
+//--- gates that make looking for a signal pointless (no zones, trade running, weekly limits)
+bool HardGate(string &why)
   {
-   datetime now = TimeCurrent();
    if(!g_week.valid)
      {
       why = "Waiting for D1 zones (built after the Tuesday close)";
       return false;
      }
-   if(TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) == 0 || MQLInfoInteger(MQL_TRADE_ALLOWED) == 0)
+   if(!g_isTester)
      {
-      why = "Algo trading is disabled (AutoTrading button / EA settings)";
+      if(TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) == 0 || MQLInfoInteger(MQL_TRADE_ALLOWED) == 0)
+        {
+         why = "Algo trading is disabled (Algo Trading button / EA settings)";
+         return false;
+        }
+      if(AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) == 0 || AccountInfoInteger(ACCOUNT_TRADE_EXPERT) == 0)
+        {
+         why = "Trading not allowed on this account";
+         return false;
+        }
+     }
+   if(InpWeeklyProfitTarget > 0 && g_targetHit)
+     {
+      why = "Weekly profit target reached (" + TargetText() + ") - no new trades this week";
       return false;
      }
-   if(AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) == 0 || AccountInfoInteger(ACCOUNT_TRADE_EXPERT) == 0)
+   int setups = SetupsThisWeek();
+   if(setups >= InpMaxSetupsPerWeek)
      {
-      why = "Trading not allowed on this account";
+      why = "Weekly limit reached (" + IntegerToString(setups) + "/" + IntegerToString(InpMaxSetupsPerWeek) + " setups)";
       return false;
      }
+   int nP = 0, nR = 0;
+   if(CountOurPositions(nP, nR) > 0)
+     {
+      why = "Trade running - holding until TP / SL or weekly close";
+      return false;
+     }
+   return true;
+  }
+
+//--- filters checked when a signal appears. code: 1 day / hours, 2 session, 3 news, 4 spread
+bool SoftGate(const datetime now, string &why, int &code)
+  {
+   code = 1;
    int dow = DowOf(now);
    int hr  = HourOfDay(now);
    bool dayOk = (dow == 3 && InpTradeWednesday) || (dow == 4 && InpTradeThursday) || (dow == 5 && InpTradeFriday);
@@ -1729,35 +1800,21 @@ bool CanOpenNewSetup(string &why)
       why = "Too close to the weekly close";
       return false;
      }
+   code = 2;
    string sess = "";
    if(!SessionAllows(now, sess))
      {
       why = "Session filter: " + sess;
       return false;
      }
+   code = 3;
    int ni = BlockingNews(now);
    if(ni >= 0)
      {
       why = "News pause: " + g_news[ni].name + " at " + TimeToString(g_news[ni].time, TIME_MINUTES);
       return false;
      }
-   if(InpWeeklyProfitTarget > 0 && g_targetHit)
-     {
-      why = "Weekly profit target reached (" + TargetText() + ") - no new trades this week";
-      return false;
-     }
-   int setups = SetupsThisWeek();
-   if(setups >= InpMaxSetupsPerWeek)
-     {
-      why = "Weekly limit reached (" + IntegerToString(setups) + "/" + IntegerToString(InpMaxSetupsPerWeek) + " setups)";
-      return false;
-     }
-   int nP = 0, nR = 0;
-   if(CountOurPositions(nP, nR) > 0)
-     {
-      why = "Trade running - holding until TP / SL or weekly close";
-      return false;
-     }
+   code = 4;
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick))
      {
@@ -1766,10 +1823,19 @@ bool CanOpenNewSetup(string &why)
      }
    if(tick.ask - tick.bid > InpMaxSpread)
      {
-      why = "Spread too high (" + P2S(tick.ask - tick.bid) + ")";
+      why = "Spread too high (" + P2S(tick.ask - tick.bid) + " > max " + P2S(InpMaxSpread) + ")";
       return false;
      }
+   code = 0;
    return true;
+  }
+
+bool CanOpenNewSetup(string &why)
+  {
+   if(!HardGate(why))
+      return false;
+   int code = 0;
+   return SoftGate(TimeCurrent(), why, code);
   }
 
 //+------------------------------------------------------------------+
@@ -1778,8 +1844,8 @@ bool CanOpenNewSetup(string &why)
 //|        closes below the last swing low formed before the tap.    |
 //|  BUY : mirror image. Only the FIRST break after the tap counts.  |
 //+------------------------------------------------------------------+
-bool CheckChoch(const SOrderBlock &ob, const MqlRates &m5[], const int count, const double atr,
-                string &pattern, double &sweepExt, double &level)
+bool CheckChoch(const SOrderBlock &ob, const MqlRates &m5[], const int count, const double atr, const int late,
+                string &pattern, double &sweepExt, double &level, int &breakBar)
   {
    int k = (InpChochSwingBars > 0) ? InpChochSwingBars : 1;
    int maxW = InpChochWindow;
@@ -1822,12 +1888,20 @@ bool CheckChoch(const SOrderBlock &ob, const MqlRates &m5[], const int count, co
    if(!found)
       return false;
 
-   //--- 3. the break: the last closed candle closes beyond the swing, first time since the tap
-   if(isSell ? !(m5[1].close < level) : !(m5[1].close > level))
-      return false;
-   for(int s2 = 2; s2 <= p; s2++)
+   //--- 3. the break: first candle after the tap that closes beyond the swing. It must be one of the
+   //---    candles closed since the previous check ('late', normally 1) and price must still be beyond it
+   int b = -1;
+   for(int s2 = p; s2 >= 1; s2--)
       if(isSell ? (m5[s2].close < level) : (m5[s2].close > level))
-         return false;                       // the break already happened earlier
+        {
+         b = s2;
+         break;
+        }
+   if(b < 0 || b > late)
+      return false;                          // no break yet, or it was already evaluated earlier
+   if(isSell ? !(m5[1].close < level) : !(m5[1].close > level))
+      return false;                          // price is back on the wrong side of the swing
+   breakBar = b;
 
    sweepExt = isSell ? m5[p].high : m5[p].low;
    string side = isSell ? "below swing low " : "above swing high ";
@@ -1848,90 +1922,119 @@ bool CheckChoch(const SOrderBlock &ob, const MqlRates &m5[], const int count, co
   }
 
 //--- entry signal at one point of interest (H4 order block or D1 zone):
-//--- fills the SL anchor (candle / structure extreme) and the arrow position
-bool FindEntrySignal(const SOrderBlock &poi, const MqlRates &m5[], const int count, const double atr,
+//--- fills the SL anchor (candle / structure extreme) and the arrow position.
+//--- 'late' = M5 candles closed since the previous check (normally 1)
+bool FindEntrySignal(const SOrderBlock &poi, const MqlRates &m5[], const int count, const double atr, const int late,
                      string &pattern, double &ext, datetime &sigTime, double &sigPrice)
   {
    bool isSell = (poi.dir < 0);
    if(InpEntryConfirm == CONFIRM_REJECTION)
      {
-      int sig = InpRequireConfirm ? 2 : 1;
-      if(!IsRejection(poi, m5, sig, atr, pattern))
-         return false;
-      ext = isSell ? m5[sig].high : m5[sig].low;
-      if(InpRequireConfirm)
+      for(int c = 1; c <= late; c++)
         {
-         if(isSell && !(m5[1].close < m5[2].low))
-            return false;
-         if(!isSell && !(m5[1].close > m5[2].high))
-            return false;
-         pattern += " + confirmation candle";
-         ext = isSell ? MathMax(ext, m5[1].high) : MathMin(ext, m5[1].low);
+         int sig = InpRequireConfirm ? c + 1 : c;
+         if(sig + 1 >= count)
+            break;
+         string pt = "";
+         if(!IsRejection(poi, m5, sig, atr, pt))
+            continue;
+         double e = isSell ? m5[sig].high : m5[sig].low;
+         if(InpRequireConfirm)
+           {
+            if(isSell && !(m5[c].close < m5[sig].low))
+               continue;
+            if(!isSell && !(m5[c].close > m5[sig].high))
+               continue;
+            pt += " + confirmation candle";
+            e = isSell ? MathMax(e, m5[c].high) : MathMin(e, m5[c].low);
+           }
+         pattern  = pt;
+         ext      = e;
+         sigTime  = m5[sig].time;
+         sigPrice = e;
+         return true;
         }
-      sigTime  = m5[sig].time;
-      sigPrice = ext;
-      return true;
+      return false;
      }
    double sweep = 0.0, level = 0.0;
-   if(!CheckChoch(poi, m5, count, atr, pattern, sweep, level))
+   int brk = 1;
+   if(!CheckChoch(poi, m5, count, atr, late, pattern, sweep, level, brk))
       return false;
    ext      = sweep;
-   sigTime  = m5[1].time;
-   sigPrice = isSell ? m5[1].high : m5[1].low;
+   sigTime  = m5[brk].time;
+   sigPrice = isSell ? m5[brk].high : m5[brk].low;
    return true;
+  }
+
+void LogSignal(const string tag, const string reason)
+  {
+   g_lastBlock = reason;
+   if(InpLogSignals)
+      Print("SIGNAL ", tag, " -> NOT TAKEN: ", reason);
   }
 
 void CheckEntries(void)
   {
    int k    = (InpChochSwingBars > 0) ? InpChochSwingBars : 1;
    int need = InpChochWindow + InpChochSwingLookback + k + 6;
-   if(need < 8)
-      need = 8;
+   if(need < 20)
+      need = 20;
    MqlRates m5[];
    ArraySetAsSeries(m5, true);
    int count = CopyRates(_Symbol, PERIOD_M5, 0, need, m5);
    if(count < 6)
       return;
 
-   //--- an M5 close through the order block invalidates it
-   for(int i = 0; i < ArraySize(g_obs); i++)
+   //--- M5 candles closed since the previous check (> 1 when ticks were skipped, e.g. tester 'Open prices only')
+   int late = 1;
+   if(g_lastEvalBar > 0)
      {
-      if(!g_obs[i].valid)
-         continue;
-      if((g_obs[i].dir < 0 && m5[1].close > g_obs[i].high) || (g_obs[i].dir > 0 && m5[1].close < g_obs[i].low))
+      late = 0;
+      for(int s = 1; s < count && m5[s].time > g_lastEvalBar; s++)
+         late++;
+      if(late < 1)
+         late = 1;
+      if(late > 12)
+         late = 12;
+     }
+   g_lastEvalBar = m5[1].time;
+
+   for(int s = late; s >= 1; s--)
+     {
+      //--- an M5 close through an order block invalidates it
+      for(int i = 0; i < ArraySize(g_obs); i++)
         {
-         g_obs[i].valid = false;
-         DrawOB(g_obs[i]);
+         if(!g_obs[i].valid)
+            continue;
+         if((g_obs[i].dir < 0 && m5[s].close > g_obs[i].high) || (g_obs[i].dir > 0 && m5[s].close < g_obs[i].low))
+           {
+            g_obs[i].valid = false;
+            DrawOB(g_obs[i]);
+           }
+        }
+      //--- an M5 close beyond a D1 zone (incl. its sweep allowance) = zone broken for the rest of the week
+      if(g_week.valid && g_week.sellZoneOk && m5[s].close > g_week.sellTop)
+        {
+         g_week.sellZoneOk = false;
+         DrawWeek();
+         if(InpEntryPOI != POI_OB_ONLY)
+            TgSend(E_Warn() + " " + _Symbol + " D1 SELL zone broken (M5 close above " + P2S(g_week.sellTop) + ") - no more sell-zone entries this week");
+        }
+      if(g_week.valid && g_week.buyZoneOk && m5[s].close < g_week.buyBottom)
+        {
+         g_week.buyZoneOk = false;
+         DrawWeek();
+         if(InpEntryPOI != POI_OB_ONLY)
+            TgSend(E_Warn() + " " + _Symbol + " D1 BUY zone broken (M5 close below " + P2S(g_week.buyBottom) + ") - no more buy-zone entries this week");
         }
      }
 
-   //--- an M5 close beyond a D1 zone (incl. its sweep allowance) = zone broken for the rest of the week
-   if(g_week.valid && g_week.sellZoneOk && m5[1].close > g_week.sellTop)
-     {
-      g_week.sellZoneOk = false;
-      DrawWeek();
-      if(InpEntryPOI != POI_OB_ONLY)
-         TgSend(E_Warn() + " " + _Symbol + " D1 SELL zone broken (M5 close above " + P2S(g_week.sellTop) + ") - no more sell-zone entries this week");
-     }
-   if(g_week.valid && g_week.buyZoneOk && m5[1].close < g_week.buyBottom)
-     {
-      g_week.buyZoneOk = false;
-      DrawWeek();
-      if(InpEntryPOI != POI_OB_ONLY)
-         TgSend(E_Warn() + " " + _Symbol + " D1 BUY zone broken (M5 close below " + P2S(g_week.buyBottom) + ") - no more buy-zone entries this week");
-     }
-
    string why = "";
-   if(!CanOpenNewSetup(why))
+   if(!HardGate(why))
      {
       g_status = why;
       return;
      }
-
-   double atrM5 = GetATR(g_hAtrM5, 1);
-   if(atrM5 <= 0)
-      atrM5 = m5[1].high - m5[1].low;
-   g_trendDir = TrendDir();
 
    //--- points of interest: H4 order blocks first, then the D1 zones themselves
    SOrderBlock poi[];
@@ -1954,48 +2057,84 @@ void CheckEntries(void)
          PushPOI(poi, src, z, -1);
         }
      }
-
-   int active = ArraySize(poi), againstTrend = 0;
-   for(int i = 0; i < active; i++)
-      if(!TrendAllows(poi[i].dir, g_trendDir))
-         againstTrend++;
+   int active = ArraySize(poi);
    if(active == 0)
      {
       g_status = "Watching: no active H4 order block / D1 zone";
       return;
      }
-   if(againstTrend == active)
-     {
-      g_status = "HTF trend " + TrendText(g_trendDir) + ": active OB / zone(s) are against the trend";
-      return;
-     }
+   DIAG(barsWatched);
+   bool touched = false;
+   for(int i = 0; i < active && !touched; i++)
+      for(int s = 1; s <= late && !touched; s++)
+         if(m5[s].high >= poi[i].low && m5[s].low <= poi[i].high)
+            touched = true;
+   if(touched)
+      DIAG(barsTouch);
+
+   double atrM5 = GetATR(g_hAtrM5, 1);
+   if(atrM5 <= 0)
+      atrM5 = m5[1].high - m5[1].low;
+   g_trendDir = TrendDir();
+   string softWhy = "";
+   int softCode = 0;
+   bool softOk = SoftGate(TimeCurrent(), softWhy, softCode);
    string confirmTxt = (InpEntryConfirm == CONFIRM_REJECTION) ? "rejection candle"
                        : (InpEntryConfirm == CONFIRM_CHOCH ? "ChoCH" : "rejection + ChoCH");
-   g_status = "Watching " + IntegerToString(active - againstTrend) + " H4 OB / D1 zone(s) for an M5 " + confirmTxt;
+   if(softOk)
+      g_status = "Watching " + IntegerToString(active) + " H4 OB / D1 zone(s) for an M5 " + confirmTxt;
+   else
+      g_status = softWhy;
 
+   int blockedDirs = 0;                      // bit 1 = sell, bit 2 = buy: already blocked by a filter this bar
    for(int i = 0; i < active; i++)
      {
-      if(!TrendAllows(poi[i].dir, g_trendDir))
+      int bit = (poi[i].dir < 0) ? 1 : 2;
+      if((blockedDirs & bit) != 0)
          continue;
       string pattern = "";
       double ext = 0.0, sigPrice = 0.0;
       datetime sigTime = 0;
-      if(!FindEntrySignal(poi[i], m5, count, atrM5, pattern, ext, sigTime, sigPrice))
+      if(!FindEntrySignal(poi[i], m5, count, atrM5, late, pattern, ext, sigTime, sigPrice))
          continue;
+      bool isZone = (src[i] < 0);
+      string where = isZone ? " at D1 zone " : " at H4 OB ";
+      string tag = DirText(poi[i].dir < 0) + where + P2S(poi[i].low) + "-" + P2S(poi[i].high) + " [" + pattern + "]";
+      DIAG(signals);
+      if(!TrendAllows(poi[i].dir, g_trendDir))
+        {
+         DIAG(blkTrend);
+         LogSignal(tag, "HTF trend " + TrendText(g_trendDir));
+         blockedDirs |= bit;
+         continue;
+        }
+      if(!softOk)
+        {
+         if(softCode == 1)
+            DIAG(blkTime);
+         if(softCode == 2)
+            DIAG(blkSession);
+         if(softCode == 3)
+            DIAG(blkNews);
+         if(softCode == 4)
+            DIAG(blkSpread);
+         LogSignal(tag, softWhy);
+         blockedDirs |= bit;
+         continue;
+        }
       if(InpRequireSweep && !LiquiditySwept(poi[i].dir))
         {
-         g_status = "Signal seen but the Fri/Mon/Tue liquidity is not swept yet";
+         DIAG(blkSweep);
+         LogSignal(tag, "the Fri/Mon/Tue liquidity is not swept yet");
+         blockedDirs |= bit;
          continue;
         }
-      bool isZone = (src[i] < 0);
-      int res = OpenSetup(poi[i], isZone, ext, sigTime, sigPrice, pattern);
-      if(res != 0 && !isZone)
-        {
-         g_obs[src[i]].used = true;           // traded, or skipped for good (lot / risk limits)
-         DrawOB(g_obs[src[i]]);
-        }
+      string skip = "";
+      int code = 0;
+      int res = OpenSetup(poi[i], isZone, ext, sigTime, sigPrice, pattern, skip, code);
       if(res > 0)
         {
+         DIAG(opened);
          if(isZone)
            {
             if(poi[i].dir < 0)
@@ -2003,7 +2142,24 @@ void CheckEntries(void)
             else
                g_zoneBuyMem++;
            }
+         else
+           {
+            g_obs[src[i]].used = true;
+            DrawOB(g_obs[src[i]]);
+           }
          break;
+        }
+      if(code == 1)
+         DIAG(skipMaxSL);
+      if(code == 2)
+         DIAG(skipLots);
+      if(code == 3)
+         DIAG(failOrder);
+      LogSignal(tag, skip);
+      if(res < 0 && !isZone)
+        {
+         g_obs[src[i]].used = true;          // skipped for good (lot / risk limits)
+         DrawOB(g_obs[src[i]]);
         }
      }
   }
@@ -2026,6 +2182,121 @@ void MakeZonePOI(const int dir, SOrderBlock &z)
    z.low   = (dir < 0) ? g_week.sellBottom : g_week.buyBottom;
    z.valid = true;
    z.used  = false;
+  }
+
+//+------------------------------------------------------------------+
+//| Max SL + diagnostics (why trades were / were not taken)          |
+//+------------------------------------------------------------------+
+double MaxSLPrice(void)
+  {
+   double m = InpMaxSL;
+   if(m <= 0)
+     {
+      double atr = (g_week.atrD1 > 0) ? g_week.atrD1 : GetATR(g_hAtrD1, 1);
+      m = (atr > 0) ? InpMaxSLATR * atr : 60.0;
+     }
+   return (m > InpMinSL) ? m : InpMinSL + 1.0;
+  }
+
+string DiagLine(const SDiag &d)
+  {
+   return "zones " + IntegerToString(d.zonesBuilt) + " | H4 OBs " + IntegerToString(d.obsFound)
+          + " | M5 bars at OB/zone " + IntegerToString(d.barsTouch) + "/" + IntegerToString(d.barsWatched)
+          + " | signals " + IntegerToString(d.signals) + " -> opened " + IntegerToString(d.opened)
+          + " (trend " + IntegerToString(d.blkTrend) + ", session " + IntegerToString(d.blkSession)
+          + ", news " + IntegerToString(d.blkNews) + ", day/time " + IntegerToString(d.blkTime)
+          + ", spread " + IntegerToString(d.blkSpread) + ", sweep " + IntegerToString(d.blkSweep)
+          + ", SL>max " + IntegerToString(d.skipMaxSL) + ", lot/risk " + IntegerToString(d.skipLots)
+          + ", order failed " + IntegerToString(d.failOrder) + ")";
+  }
+
+void PrintWeekDiag(const datetime ws)
+  {
+   Print("WEEK ", TimeToString(ws, TIME_DATE), ": ", DiagLine(g_diagW));
+  }
+
+string DiagReportText(void)
+  {
+   SDiag d;
+   d = g_diag;
+   string s = E_Chart() + " " + g_eaName + " v" + g_eaVer + " - DIAGNOSTICS (" + _Symbol + ")\n";
+   s += "Weeks: " + IntegerToString(d.weeks) + " | D1 zones built: " + IntegerToString(d.zonesBuilt)
+        + " | H4 order blocks: " + IntegerToString(d.obsFound) + "\n";
+   s += "M5 bars watched (Wed-Fri, zones ready, no trade open): " + IntegerToString(d.barsWatched)
+        + " | price at an OB / zone: " + IntegerToString(d.barsTouch) + "\n";
+   s += "Entry signals (" + ConfirmModeText() + "): " + IntegerToString(d.signals) + "\n";
+   s += "  blocked by HTF trend: " + IntegerToString(d.blkTrend) + "\n";
+   s += "  blocked by session filter: " + IntegerToString(d.blkSession) + "\n";
+   s += "  blocked by news filter: " + IntegerToString(d.blkNews) + "\n";
+   s += "  blocked by day / hours / Friday cut-off: " + IntegerToString(d.blkTime) + "\n";
+   s += "  blocked by spread: " + IntegerToString(d.blkSpread) + "\n";
+   s += "  blocked by liquidity-sweep rule: " + IntegerToString(d.blkSweep) + "\n";
+   s += "  skipped - SL above maximum: " + IntegerToString(d.skipMaxSL) + "\n";
+   s += "  skipped - lot / risk / margin: " + IntegerToString(d.skipLots) + "\n";
+   s += "  order rejected: " + IntegerToString(d.failOrder) + "\n";
+   s += "Setups opened: " + IntegerToString(d.opened) + "\n";
+   //--- tips for the biggest blocker
+   string tip = "";
+   if(d.weeks < 2)
+      tip = "Test a longer period (at least 2-3 months): the EA only trades Wed / Thu / Fri after the Tuesday D1 close.";
+   else
+      if(d.zonesBuilt == 0)
+         tip = "D1 zones were never built: not enough D1 history for the test start.";
+      else
+         if(d.barsTouch == 0)
+            tip = "Price never reached an H4 order block / D1 zone on Wed-Fri: raise 'Zone depth %' or 'Zone extends beyond the extreme'.";
+         else
+            if(d.signals == 0)
+               tip = "Price reached the zones but the M5 confirmation never formed: set 'Entry confirmation' = 'M5 ChoCH only' or 'Rejection candle only', or raise the ChoCH window.";
+   if(tip == "" && d.opened == 0 && d.signals > 0)
+     {
+      int mx = d.blkTrend;
+      tip = "Most signals were against the HTF trend: set 'Trend filter mode' = Off, or 'No trades when the trend is neutral' = false.";
+      if(d.blkSession > mx)
+        {
+         mx = d.blkSession;
+         tip = "Most signals were outside London / New York: set 'Only enter during the selected sessions' = false or add the Asian session.";
+        }
+      if(d.blkNews > mx)
+        {
+         mx = d.blkNews;
+         tip = "Most signals were inside a news pause: lower the news minutes or switch the news filter off.";
+        }
+      if(d.blkTime > mx)
+        {
+         mx = d.blkTime;
+         tip = "Most signals were outside the entry days / hours: check 'Entry window' and 'Friday: no new entries from this hour'.";
+        }
+      if(d.blkSpread > mx)
+        {
+         mx = d.blkSpread;
+         tip = "Most signals had a too-wide spread: raise 'Maximum spread' (the tester uses your broker's spread).";
+        }
+      if(d.skipMaxSL > mx)
+        {
+         mx = d.skipMaxSL;
+         tip = "Most signals needed a stop wider than the maximum: raise 'Maximum SL' or 'Automatic maximum SL = x D1 ATR'.";
+        }
+      if(d.skipLots > mx)
+        {
+         mx = d.skipLots;
+         tip = "The deposit is too small for 2 x minimum lot at this stop: raise the tester deposit, 'Max risk %', or use Lot mode = Fixed.";
+        }
+      if(d.failOrder > mx)
+         tip = "Orders were rejected by the server: see the Journal for the error code.";
+     }
+   if(tip != "")
+      s += "TIP: " + tip;
+   return s;
+  }
+
+void PrintDiagReport(void)
+  {
+   string lines[];
+   int n = StringSplit(DiagReportText(), '\n', lines);
+   for(int i = 0; i < n; i++)
+      if(lines[i] != "")
+         Print(lines[i]);
   }
 
 //+------------------------------------------------------------------+
@@ -2082,8 +2353,8 @@ bool CalcLots(const bool isSell, const double entry, const double sl, double &lo
    riskMoney = (lotP + lotR) * lossPerLot;
    if(InpLotMode == LOT_RISK_PERCENT && bal > 0 && riskMoney > bal * InpMaxRiskPercent / 100.0)
      {
-      err = "minimum lot risk " + M2S(riskMoney) + " " + Currency() + " is above the max "
-            + DoubleToString(InpMaxRiskPercent, 1) + "% of balance";
+      err = "2 x minimum lot risks " + M2S(riskMoney) + " " + Currency() + " = above the max "
+            + DoubleToString(InpMaxRiskPercent, 1) + "% of balance (deposit too small for this SL - raise the deposit, 'Max risk %' or use fixed lots)";
       return false;
      }
    double margin = 0.0;
@@ -2176,12 +2447,18 @@ string FiltersStatusText(const datetime now)
 
 //--- returns 1 = opened, 0 = not opened (retry on a later signal), -1 = skipped for good (lot / risk limits)
 int OpenSetup(const SOrderBlock &poi, const bool isZone, const double candleExt, const datetime sigTime,
-              const double sigPrice, const string pattern)
+              const double sigPrice, const string pattern, string &skipWhy, int &skipCode)
   {
+   skipWhy  = "";
+   skipCode = 0;
    bool isSell = (poi.dir < 0);
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick))
+     {
+      skipWhy  = "no price";
+      skipCode = 3;
       return 0;
+     }
    double spread = tick.ask - tick.bid;
    double entry  = isSell ? tick.bid : tick.ask;
 
@@ -2199,10 +2476,12 @@ int OpenSetup(const SOrderBlock &poi, const bool isZone, const double candleExt,
       sl   = isSell ? entry + minSL : entry - minSL;
       risk = minSL;
      }
-   if(risk > InpMaxSL)
+   double maxSL = MaxSLPrice();
+   if(risk > maxSL)
      {
-      g_status = DirText(isSell) + " signal skipped: SL " + P2S(risk) + " > max " + P2S(InpMaxSL);
-      Print(g_status);
+      skipWhy  = "SL " + P2S(risk) + " > max " + P2S(maxSL) + " (raise 'Maximum SL' / the D1 ATR multiple)";
+      skipCode = 1;
+      g_status = DirText(isSell) + " signal skipped: " + skipWhy;
       return 0;
      }
 
@@ -2250,8 +2529,9 @@ int OpenSetup(const SOrderBlock &poi, const bool isZone, const double candleExt,
    string err = "";
    if(!CalcLots(isSell, entry, sl, lotP, lotR, riskMoney, err))
      {
+      skipWhy  = err;
+      skipCode = 2;
       g_status = DirText(isSell) + " signal skipped: " + err;
-      Print(g_status);
       TgSend(E_Warn() + " " + _Symbol + " " + DirText(isSell) + " signal skipped: " + err);
       return -1;                             // caller stops retrying this order block
      }
@@ -2285,6 +2565,8 @@ int OpenSetup(const SOrderBlock &poi, const bool isZone, const double candleExt,
    if(!okP && !okR)
      {
       g_status = "Order failed: " + g_tradeP.ResultRetcodeDescription();
+      skipWhy  = "order rejected by the server: " + g_tradeP.ResultRetcodeDescription();
+      skipCode = 3;
       TgSend(E_X() + " " + _Symbol + " " + DirText(isSell) + " entry FAILED: " + g_tradeP.ResultRetcodeDescription());
       return 0;
      }
@@ -2892,6 +3174,8 @@ void UpdatePanel(void)
    PushLine(L, "News: " + news);
    PushLine(L, "HTF trend: " + TrendText(g_trendDir));
    PushLine(L, "Entry: " + ConfirmModeText() + " | TP2: " + StringSubstr(TP2ModeText(), 0, 30));
+   PushLine(L, "Signals " + IntegerToString(g_diag.signals) + " | opened " + IntegerToString(g_diag.opened)
+            + (g_lastBlock != "" ? " | last block: " + StringSubstr(g_lastBlock, 0, 32) : ""));
    PushLine(L, "Status: " + StringSubstr(g_status, 0, 58));
    PushLine(L, "Telegram: " + tg);
 
@@ -3154,6 +3438,7 @@ string HelpText(void)
           + "/zones - D1 liquidity zones, Tuesday 50% TP1, H4 order blocks\n"
           + "/report - today + this week results\n"
           + "/news - upcoming high-impact news (48h)\n"
+          + "/diag - why trades were / were not taken\n"
           + "/chart - chart screenshot\n"
           + "/help - this list";
   }
@@ -3198,6 +3483,9 @@ void TgHandleCommand(const string raw)
             if(cmd == "/news")
                TgSend(BuildNewsText());
             else
+               if(cmd == "/diag")
+                  TgSend(DiagReportText());
+               else
             if(cmd == "/chart")
                TgSendScreenshot(_Symbol + " - " + DayTime(ServerNow()) + " (server)");
             else
@@ -3377,6 +3665,7 @@ void TryBuildWeek(void)
   {
    if(!BuildWeeklyLiquidity(g_curWeekStart))
       return;
+   DIAG(zonesBuilt);
    ScanOrderBlocks(false);
    g_lastH4Bar = iTime(_Symbol, PERIOD_H4, 0);
    DrawWeek();
@@ -3423,8 +3712,8 @@ bool ValidateInputs(void)
                   if(InpCloseHour < 0 || InpCloseHour > 23 || InpCloseMinute < 0 || InpCloseMinute > 59)
                      e = "Weekly close time is invalid";
                   else
-                     if(InpMaxSL <= InpMinSL)
-                        e = "Max SL must be greater than min SL";
+                     if((InpMaxSL > 0 && InpMaxSL <= InpMinSL) || (InpMaxSL <= 0 && InpMaxSLATR <= 0))
+                        e = "Max SL must be greater than min SL (or 0 with a positive D1 ATR multiple)";
                      else
                         if(InpOBLookback < 5 || InpOBImpulseBars < 1 || InpMaxOBsPerSide < 1)
                            e = "Order block settings are invalid";
@@ -3523,6 +3812,10 @@ int OnInit()
    g_curWeekStart = 0;
    g_lastM5Bar    = 0;
    g_lastH4Bar    = 0;
+   g_lastEvalBar  = 0;
+   g_lastBlock    = "";
+   ZeroMemory(g_diag);
+   ZeroMemory(g_diagW);
    EnsureWeek(ServerNow());
 
    if(!g_isTester)
@@ -3563,6 +3856,9 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    EventKillTimer();
+   if(g_curWeekStart > 0)
+      PrintWeekDiag(g_curWeekStart);
+   PrintDiagReport();
    if(g_hAtrD1 != INVALID_HANDLE)
       IndicatorRelease(g_hAtrD1);
    if(g_hAtrH4 != INVALID_HANDLE)

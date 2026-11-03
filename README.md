@@ -21,6 +21,23 @@ A swing-trading Expert Advisor for **XAUUSD (Gold)** that follows this rule set:
 | 8 | Exit | Trades are **never closed early** – they run until TP / SL / trailing stop, or until the **weekly close on Saturday 04:30**. |
 | 9 | Reports | **Telegram bot**: zones, order blocks, entries, news pauses, TP1 / trailing / SL, weekly close, daily + weekly reports, `/commands`. |
 
+## No trades in the Strategy Tester? (v2.11)
+
+v2.11 fixes the two most common causes and tells you the exact reason for anything else:
+
+* **Max stop loss is now automatic** (`Maximum SL` = 0 → `1.0 x D1 ATR`). The old fixed $40 limit rejected most M5 ChoCH entries at today's gold prices (an entry after the structure break is usually $40-60 from the tap high). Lot size still follows your risk %, so a wider stop means a smaller lot, not more risk.
+* **Signals are no longer lost when the tester skips M5 bars** ("Open prices only" model or a chart timeframe above M5). The EA now also checks the M5 candles that closed since its last tick.
+* **Diagnostics**: every signal that is not traded is written to the tester **Journal** with its reason, e.g. `SIGNAL SELL at H4 OB 4039.50-4044.50 [...] -> NOT TAKEN: HTF trend D1 UP (buys only)`. At the end of each week and at the end of the test the EA prints a report:
+
+```
+WEEK 2026.11.02: zones 1 | H4 OBs 3 | M5 bars at OB/zone 6/575 | signals 3 -> opened 0 (trend 0, session 0, ..., lot/risk 3, ...)
+Entry signals (M5 rejection + ChoCH): 3
+  skipped - lot / risk / margin: 3
+TIP: The deposit is too small for 2 x minimum lot at this stop: raise the tester deposit, 'Max risk %', or use Lot mode = Fixed.
+```
+
+Recommended tester settings: **XAUUSD, M5, "Every tick based on real ticks"** (or "1 minute OHLC"), at least **3 months**, deposit **$3,000+** with risk mode (2 trades x 0.01 lot with a $45 stop already risk ~$90 - with a smaller deposit use `Lot mode = Fixed`). If the report shows most signals blocked by one filter (trend / session / news), relax that filter. In Telegram, `/diag` sends the same report.
+
 ## Version 2.10 – weekly limits and D1 zone entries
 
 * **Up to 5 setups per week** (`Max setups per week`, default 5). Each setup is still 2 trades (TP1 partial + TP2 / trailing), and only one setup is open at a time.
@@ -151,7 +168,8 @@ So a trade opened on Wednesday is held through Thursday and Friday until TP / SL
 | Risk | Max risk % cap | 3% | Skips the setup if min-lot rounding would risk more |
 | Risk | Reward:risk | 2.0 | TP2 |
 | Risk | SL placement | Beyond H4 OB | Or beyond the M5 rejection candle |
-| Risk | SL buffer / min / max | 0.50 / 3 / 40 ($) | Price distances in dollars |
+| Risk | SL buffer / min / max | 0.50 / 3 / 0 = auto ($) | Price distances in dollars; max 0 = automatic `1.0 x D1 ATR` |
+| General | Log every signal | true | Journal line for every signal that was not traded, with the reason |
 | Risk | Max spread | 0.80 ($) | No entry when the spread is wider |
 | Risk | Max setups per week | 5 | Each setup = 2 trades (partial + full) |
 | Weekly target | Profit target / count floating / close trades | 250 / true / true | Stop for the week at +250 (account currency) |
