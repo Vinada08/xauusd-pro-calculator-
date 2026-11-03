@@ -184,6 +184,48 @@ So a trade opened on Wednesday is held through Thursday and Friday until TP / SL
 * Telegram is not available in the tester (MetaTrader blocks WebRequest there); the messages are printed in the journal instead when Telegram is enabled.
 * Use **visual mode** to see the zones, the yellow Tuesday candle / 50% line and the order blocks being drawn.
 
+---
+
+# XAUUSD Liquidity Scalper EA (MetaTrader 5)
+
+File: [`MQL5/Experts/XAUUSD_Liquidity_Scalper_EA.mq5`](MQL5/Experts/XAUUSD_Liquidity_Scalper_EA.mq5)
+
+The intraday / scalping version of the same liquidity idea. It can run next to the swing EA (own magic number `270511`, own chart objects `LSC_`) - put each EA on its own XAUUSD chart.
+
+| Step | What the scalper does |
+|------|-----------------------|
+| 1. Liquidity | Every day it maps the **previous day high / low**, the **Asian range high / low** (00:00-06:00 GMT) and **unswept H1 swing highs / lows** (last 24 hours). |
+| 2. Sweep | Inside the **London (07-10 London time)** or **New York (08-11 New York time) killzone**, price must **sweep** a level: trade through it by 0.1-1.5 x M5 ATR. A close further beyond = breakout, the level is retired for the day. |
+| 3. Confirmation | An **M1 ChoCH**: an M1 candle closes through the last M1 swing that formed before the sweep, and the move leaves an **M1 fair value gap** (real displacement). |
+| 4. Entry | Market order, **SL beyond the sweep extreme** (+$0.20 buffer + spread), **2 trades**: TP1 at **1R** (partial) and TP2 at **2R** (or ATR trailing), TP2 trade moved to **breakeven** after TP1. |
+| 5. Filters | Spread <= $0.40, high-impact news pause (30 min before / after), H1 EMA 50 bias (trades against the bias are blocked, neutral allowed), optional M5 ATR volatility band. |
+| 6. Risk control | **0.5% risk per setup**, max **4 setups per day**, **stop for the day after 2 losing setups in a row**, **daily loss limit 2%**, optional daily profit target, **weekly profit target $250**, 10 min cooldown after each setup. |
+| 7. Exits | Besides TP / SL: **max hold 120 min**, **daily close 23:30 server** (before the rollover spread), **Friday close** before the weekend, and open scalps are **closed 5 min before high-impact news**. |
+| 8. Reports | Telegram: start message, daily **liquidity map** with screenshot, every entry / TP / SL / time exit, "scalp finished" result, daily stop alerts, news pauses, daily + weekly reports. Commands `/status /levels /report /news /diag /chart /help`. |
+
+**Diagnostics** work like in the swing EA v2.11: every signal that is not traded is logged in the Journal with its reason (`SIGNAL BUY after the sweep of the Asian low ... -> NOT TAKEN: no M1 fair value gap`), a `DAY ...` line is printed for every day and a full report with a **TIP** at the end of a test (Telegram `/diag`).
+
+**Backtesting the scalper**: XAUUSD, period **M1** (or M5), model **"Every tick based on real ticks"**, at least **1 month**, deposit **$1,000+** (2 x 0.01 lot with an $8 stop risks ~$16; with the 2% cap a smaller deposit can skip setups - or use `Lot mode = Fixed`). Scalping results depend heavily on **spread, commission and slippage** - test with your broker's real ticks and commission, then on a demo account.
+
+**Main scalper inputs**
+
+| Group | Input | Default |
+|-------|-------|---------|
+| Killzones | London / New York / Asia | 7-10 London time / 8-11 New York time / off |
+| Liquidity | Asian range, previous day, H1 swings | on / on / on (24 H1 bars, strength 2) |
+| Liquidity | Sweep min / max | 0.10 / 1.50 x M5 ATR |
+| M1 entry | Entry confirmation / FVG required | M1 ChoCH / true |
+| M1 entry | ChoCH swing strength / window / lookback | 2 / 30 / 20 M1 bars |
+| Risk | Risk % / TP1 / TP2 / TP2 mode | 0.5% / 1R / 2R / fixed |
+| Risk | SL buffer / min / max | $0.20 / $1.50 / 0 = auto (2.5 x M15 ATR) |
+| Risk | Max spread / slippage | $0.40 / 20 points |
+| Limits | Setups per day / losses in a row / daily loss / daily target / weekly target | 4 / 2 / 2% / off / $250 |
+| Limits | Cooldown / max hold / daily close | 10 min / 120 min / 23:30 server |
+| News | Pause before / after / close open scalps before | 30 / 30 / 5 min |
+| Bias | Mode / timeframe / MA / block neutral | MA / H1 / EMA 50 / false |
+
+If both EAs use the same Telegram bot, switch `/commands` off (`Answer /status ...` = false) on one of them - Telegram delivers each command to only one program.
+
 ## Disclaimer
 
 Trading gold with leverage carries a high level of risk. This EA is provided as-is with no guarantee of profit. Always test on a demo account and in the Strategy Tester before using real money.
